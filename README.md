@@ -1,11 +1,3 @@
-RV1 Metagenomic analysis
-
-Cale Seymour, MS
-
-University of California San Diego
-
-# Rota 2025
-
 This is the code repository for the analysis of the Panama, Peru, and US multicountry RV1 microbiome cohort by the Pannaraj & Gilbert Labs. A table below lists source files and their descriptions.
 
 ## Description of contents
