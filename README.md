@@ -1,4 +1,4 @@
-This is the code repository for the analysis of the Panama, Peru, and US multicountry RV1 microbiome cohort by the Pannaraj & Gilbert Labs. A table below lists source files and their descriptions.
+This is the code repository for the analysis of the Panama, Peru, and US multicountry RV1 microbiome cohort by the Pannaraj & Gilbert Labs. A table below lists source files, outputs, and their descriptions.
 
 ## Description of contents
 Filename | Description
@@ -15,5 +15,21 @@ build-figures.Rmd | This script pulls outputs from all of the others together to
 
 Directory | Description
 ------------ | -------------
-extracts/ | Extracts and quants for calprotectin and some other datapoints that we ended up pulling after I had already done the bulk of data cleansing. These are used to make Table S1.
 data/ | Raw datafiles from metagenomics.
+include/ | Folder for gitmodules; items that are included rote from their source.
+scripts/ | Folder for miscellaneous scripts.
+
+
+## Description of output
+Filename | Description
+------------ | -------------
+m1-lgbm.rds | LightGBM ML model at timepoint 1.
+m2-lgbm.rds | LightGBM ML model at timepoint 2.
+m4-lgbm.rds | LightGBM ML model at timepoint 4.
+m4-lgbm.rds | LightGBM ML model at timepoint 4.
+
+Directory | Description
+------------ | -------------
+results/ | Output folder for other results.
+results/reports | knit-all.R will knit reports to this folder by default.
+
