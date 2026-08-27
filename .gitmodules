@@ -1,0 +1,3 @@
+[submodule "include/acPCoA"]
+	path = include/acPCoA
+	url = https://github.com/caleoseymour/acPCoA

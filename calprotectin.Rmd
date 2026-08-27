@@ -1,0 +1,243 @@
+---
+title: "Rota metagenomics: Calprotectin"
+author: "Cale Seymour"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+    number_sections: true
+    theme: lumen
+---
+```{r setup, include=FALSE}
+silence = function(x) suppressPackageStartupMessages(suppressWarnings({invisible({capture.output(x)})}))
+library = function(...) silence({base::library(...)})
+
+library('data.table')
+library('magrittr')
+library('tidyverse')
+library('car')
+library('phyloseq')
+library('mia')
+library('Maaslin2')
+knitr::opts_chunk$set(echo = TRUE)
+
+load(file = 'dmms.RData')
+load(file = 'beta-div.RData')
+load(file = 'diffabund.RData')
+
+set.seed(42)
+```
+
+```{r Prep, fig.width=3, fig.height=3}
+## prep metadata
+cal = rbind(metadata[visit == '2mo',.(enrollment_id, cal_con = calprotectin_2mo, visit = '2mo')],
+            metadata[visit == '2mo',.(enrollment_id, cal_con = calprotectin_nb, visit = '2wk')])
+            
+## log2 transform
+cal[,log2_cal_con := log2(cal_con)]
+
+setkey(cal, enrollment_id)
+setkey(cs_dmm_data, enrollment_id)
+
+cal_md = cs_dmm_data[cal,][!is.na(Seroconverted),]
+cal_md[,calprotectin_l2fc := `cal_2mo`-`cal_2wk`]
+```
+
+# Analysis vs response
+```{r}
+my_data = cal_md[,.(cal_2wk, cal_2mo, calprotectin_l2fc, log_pre_rota_sero_iga, log_post_rota_sero_iga, log_rota_sero_iga_fc)] %>% na.omit()
+
+
+res = cor(my_data, method = 'spearman')
+
+library(corrplot)
+corrplot(res, type = "upper", order = "hclust", 
+         tl.col = "black", tl.srt = 45)
+```
+
+```{r}
+library('ggplot2')
+library('ggbeeswarm')
+library('emmeans')
+
+## KW test followed by anova + tukey's for each timepoint
+kruskal.test(cal_2wk ~ country, data = cal_md)
+wilcox.test(cal_2wk ~ delivery, data = cal_md)
+kruskal.test(cal_2wk ~ formula_bm_NB, data = cal_md)
+cal_md[,cor.test(cal_2wk, gest_age, method ='spearman')]
+cal_md[,cor.test(cal_2wk, inf_birth_weight, method ='spearman')]
+kruskal.test(cal_2wk ~ inf_hispanic, data = cal_md)
+
+cal_md[,cor.test(cal_2wk, log_pre_rota_sero_iga, method ='spearman')]
+cal_md[,cor.test(cal_2wk, log_rota_sero_iga_fc, method ='spearman')]
+cal_md[,cor.test(cal_2wk, log_post_rota_sero_iga, method ='spearman')]
+
+kruskal.test(cal_2mo ~ country, data = cal_md)
+wilcox.test(cal_2mo ~ delivery, data = cal_md)
+kruskal.test(cal_2mo ~ formula_bm_2mo, data = cal_md)
+cal_md[,cor.test(cal_2mo, gest_age, method ='spearman')]
+cal_md[,cor.test(cal_2mo, inf_birth_weight, method ='spearman')]
+wilcox.test(cal_2mo ~ inf_hispanic, data = cal_md)
+
+cal_md[,cor.test(cal_2mo, log_pre_rota_sero_iga, method ='spearman')]
+cal_md[,cor.test(cal_2mo, log_rota_sero_iga_fc, method ='spearman')]
+cal_md[,cor.test(cal_2mo, log_post_rota_sero_iga, method ='spearman')]
+
+wilcox.test(cal_2wk ~ Seroconverted, data = cal_md)
+wilcox.test(cal_2mo ~ Seroconverted, data = cal_md)
+
+wilcox.test(cal_2wk ~ rota_stool_pcr, data = cal_md)
+wilcox.test(cal_2mo ~ rota_stool_pcr, data = cal_md)
+
+## These are near-correlated in this dataset, with no difference between countries.
+## (Not significantly-so, however.)
+chisq.test(cal_md[,table(Seroconverted, rota_stool_pcr)]) ## P = 0.11
+glm(factor(Seroconverted) ~ rota_stool_pcr + country, data = cal_md, family = 'binomial') %>% car::Anova()
+glm(factor(rota_stool_pcr) ~ Seroconverted + country, data = cal_md, family = 'binomial') %>% car::Anova()
+
+glm(log_pre_rota_sero_iga ~ rota_stool_pcr + country, data = cal_md) %>% car::Anova()
+glm(log_rota_sero_iga_fc ~ rota_stool_pcr + country, data = cal_md) %>% car::Anova()
+
+## Delivery + country is significant; apply tukey's HSD for pairwise comparison
+aov(cal_2mo ~ country, data = cal_md) %>% TukeyHSD()
+aov(cal_2mo ~ delivery, data = cal_md) %>% TukeyHSD()
+aov(cal_2mo ~ formula_bm_2mo, data = cal_md) %>% TukeyHSD()
+
+## 2mo
+wilcox.test(cal_2mo ~ Seroconverted, data = cal_md)
+glm(cal_2mo ~ Seroconverted + country, data = cal_md) %>% summary()
+
+## 2mo vs seroconversion
+glm(cal_2mo ~ cal_2wk, data = cal_md) %>% summary()
+glm(cal_2mo ~ country + formula_bm_2mo + gest_age + delivery + age_2mo, data = cal_md) %>% car::Anova()
+glm(cal_2mo ~ Seroconverted + country, data = cal_md) %>% summary()
+glm(cal_2mo ~ log_pre_rota_sero_iga + country, data = cal_md) %>% summary()
+glm(cal_2mo ~ log_rota_sero_iga_fc + country, data = cal_md) %>% summary()
+glm(cal_2mo ~ log_pre_rota_sero_iga + log_post_rota_sero_iga + country, data = cal_md) %>% car::Anova()
+glm(cal_2mo ~ log_pre_rota_sero_iga + log_post_rota_sero_iga + country, data = cal_md) %>% summary()
+
+## Seroconversion is confounded by pre-vaccine IgA. What about stool shedding?
+wilcox.test(cal_2wk ~ rota_stool_pcr, data = cal_md)
+wilcox.test(cal_2mo ~ rota_stool_pcr, data = cal_md)
+
+aov(cal_2wk ~ rota_stool_pcr + country, data = cal_md) %>% summary()
+
+glm(cal_2wk ~ country + delivery, data = cal_md, na.action = 'na.omit') %>% car::Anova()
+glm(cal_2wk ~ rota_stool_pcr + country, data = cal_md) %>% car::Anova()
+glm(cal_2wk ~ rota_stool_pcr + country, data = cal_md) %>% summary()
+glm(factor(rota_stool_pcr) ~ cal_2wk + country, data = cal_md, family = 'binomial') %>% car::Anova()
+
+```
+# Analysis vs Microbiome
+## vs DMM + country
+```{r}
+## Finally, look at DMMs
+
+## NB is connected  to 2-weeks
+kruskal.test(cal_2wk ~ NB, data = cal_md)
+aov(cal_2wk ~ NB, data = cal_md) %>% TukeyHSD()
+glm(cal_2wk ~ NB + country, data = cal_md) %>% summary()
+
+## Neither timepoint is significant wrt calprotectin @2mo
+kruskal.test(cal_2mo ~ NB, data = cal_md)
+kruskal.test(cal_2mo ~ X2mo, data = cal_md)
+aov(cal_2mo ~ X2mo + country + formula_bm_2mo + delivery, data = cal_md) %>% car::Anova()
+
+## Nor with l2fcs.
+kruskal.test(calprotectin_l2fc ~ NB, data = cal_md)
+kruskal.test(calprotectin_l2fc ~ X2mo, data = cal_md)
+
+ggplot(data = cal_md[!is.na(rota_stool_pcr),]
+     , aes(x = interaction(rota_stool_pcr, country), y = cal_2wk,fill = rota_stool_pcr)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_beeswarm() +
+    theme_bw()
+
+ggplot(data = cal_md[!is.na(rota_stool_pcr),]
+     , aes(x = interaction(rota_stool_pcr, country), y = cal_2mo,fill = rota_stool_pcr)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_beeswarm() +
+    theme_bw()
+
+##
+ggplot(data = cal_md[!is.na(rota_stool_pcr),]
+     , aes(x = interaction(Seroconverted, rota_stool_pcr, country), y = cal_2wk, fill = Seroconverted)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_beeswarm() +
+    facet_grid(~country, scale = 'free') +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+ggplot(data = cal_md[!is.na(NB),]
+     , aes(x = interaction(NB, country), y = cal_2wk, fill = country)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_beeswarm() +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+```
+
+## Diffabunds
+```{r}
+library('mia')
+library('Maaslin2')
+
+physeq_decon = merge_phyloseq(otudecon, taxdecon, sample_data(samdf))
+tse_decon = makeTreeSEFromPhyloseq(physeq_decon)
+tse_spp = agglomerateByRank(tse_decon, rank = 'Species')
+
+## Library size
+colData(tse_spp)$library_size = colSums(assay(tse_spp, "counts"))
+colData(tse_spp)$log_pre_rota_sero_iga = log(tse_spp$pre_rota_sero_iga)
+colData(tse_spp)$log_post_rota_sero_iga = log(tse_spp$post_rota_sero_iga)
+
+countries = metadata[,country] %>% unique() %>% na.omit()
+visits = metadata[,visit] %>% unique() %>% na.omit()
+# slice_grid = expand.grid(countries, visits) %>% na.omit()
+
+tse_sero = tse_spp[, !is.na(tse_decon$Seroconverted)] ## we have pre and post both
+tse_sero$cal_2wk = cal_md[colData(tse_sero)$enrollment_id, cal_2wk]
+
+tse_sero_subset = tse_sero %>%
+    subsetByAbundantFeatures(abundance = 0.01) %>%
+    subsetByPrevalentFeatures(prevalence = 0.05)
+
+## Define ref levels
+reference = c('country,Panama', 'formula_bm,BOTH')
+fixed_effects = c('age', 'country', 'formula_bm', 'delivery', 'library_size', 'cal_2wk')
+
+visit = 'NB'
+tse_sero_subset_v = tse_sero[,colData(tse_sero)$visit == visit] %>%
+    subsetByAbundantFeatures(abundance = 0.01) %>%
+    subsetByPrevalentFeatures(prevalence = 0.05)
+
+assign(paste0('maaslin2_out_cal_', visit)
+       , Maaslin2(input_data = tse_sero_subset_v %>% assay() %>% t() %>% as.data.frame(),
+             input_metadata = tse_sero_subset_v %>% colData() %>% as.data.frame(),
+             output = ".tmp.Maaslin2" %>% paste0(.,'_cal2wk_',visit),
+             transform = "AST",
+             fixed_effects = fixed_effects,
+             reference = reference,
+             normalization = "TSS",
+             standardize = FALSE,
+             min_prevalence = 0)
+) %>% invisible() %>% capture.output()
+
+plottingdata = maaslin2_out_cal_NB$results %>%  filter(metadata == 'cal_2wk') %>% as.data.table()
+plottingdata[,signif := assign_stars(qval)]
+
+p1 = ggplot(plottingdata) +
+    geom_point(aes(x = coef, y = -log10(pval), color = signif)) +
+    scale_y_log10() +
+    theme_bw()
+plot(p1)
+```
+
+# End
+```{r}
+save(list = ls(all.names = TRUE), file = 'calprotectin.RData')
+sessionInfo()
+```

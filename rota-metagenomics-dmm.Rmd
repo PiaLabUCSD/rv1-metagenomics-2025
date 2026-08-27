@@ -1,0 +1,1468 @@
+---
+title: "ROTA Metagenomics: DMM Clustering"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+    number_sections: true
+    theme: lumen
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, fig.width=8, fig.height=6, message = FALSE)
+```
+
+```{r libraries}
+silence = function(x) suppressPackageStartupMessages(suppressWarnings({invisible({capture.output(x)})}))
+library = function(...) silence({base::library(...)})
+
+library('data.table')
+library('tidyverse')
+library('ggplot2')
+library('DirichletMultinomial')
+library('vcdExtra')
+library('ggalluvial')
+library('viridis')
+library('cowplot')
+library('lme4')
+library('car')
+library('VGAM')
+
+load(file='beta-div.RData')
+set.seed(42)
+
+nmaxdmms = 10
+```
+
+# DMM Clustering
+## Cross-sectional DMM clustering.
+The infant gut microbiome varies significantly over time. These patterns are not necessarily linear, and metagenomic measurement is inherently compositional. Dirichlet-Multinomial Mixture (DMM) models generate de novo clusters from compositional data.
+
+This section executes DMM clustering on time-based cross-sections of the data.
+Execute Dirichlet-Multinomial Mixture Modeling cluster algo
+```{r CS_DMM}
+
+## Cross-selctional DMMs at each timepoint.
+visits = metadata[,visit] %>%
+    unique() %>%
+    na.omit() %>%
+    as.character()
+    
+#dmm_cs_fitlist = readRDS('dmm_cs_fitlist.rds')
+
+## Code for running DMMs.
+if (!file.exists('dmm_cs_fitlist.rds')) {
+    dmm_cs_fitlist = visits %>% lapply(
+    function(v)
+    {
+        s = metadata[visit == v, sample_name] %>%
+            intersect(colnames(goodcounts))
+        
+        dmm_cs_meta = metadata[sample_name %in% s,] %>% setkey(enrollment_id)
+        dmm_cs_spp = gen_counts[,s] %>% t()
+        
+        ## Fit DMMs.
+        dmm_cs_fit = lapply(2:nmaxdmms, dmn, count = dmm_cs_spp, verbose=TRUE)
+    
+        return(dmm_cs_fit)
+    }) %>% setNames(visits)
+    saveRDS(dmm_cs_fitlist, file = "dmm_cs_fitlist.rds")
+} else {
+    dmm_cs_fitlist = readRDS('dmm_cs_fitlist.rds')
+}
+
+dmm_cs_gridlist = visits %>% lapply(
+function(v)
+{
+    s = metadata[visit == v, sample_name] %>%
+        intersect(colnames(goodcounts))
+    
+    dmm_cs_meta = metadata[sample_name %in% s,] %>% setkey(enrollment_id)
+    
+    ## Fit DMMs.
+    dmm_cs_fit = dmm_cs_fitlist[[v]]
+        
+    ## Laplace plots
+    dmm_cs_lplc = data.frame(Laplace = sapply(dmm_cs_fit, DirichletMultinomial::laplace)
+                             , ncomps = 2:nmaxdmms)
+    dmm_cs_bics = data.frame(BIC = sapply(dmm_cs_fit, DirichletMultinomial::BIC)
+                             , ncomps = 2:nmaxdmms)
+    
+    ps = plot_grid(
+        ggplot(dmm_cs_lplc, aes(x = ncomps, y = Laplace)) +
+            geom_line() + geom_point() +
+            theme_bw() +
+            xlab('Number of Dirichlet Components') +
+            ylab('Laplace') +
+            ggtitle(paste0(v,'; Model Fit (Laplace)')) +
+            scale_x_continuous(breaks=2:nmaxdmms)
+        
+      , ggplot(dmm_cs_bics, aes(x = ncomps, y = BIC)) +
+            geom_line() + geom_point() +
+            theme_bw() +
+            xlab('Number of Dirichlet Components') +
+            ylab('BIC') +
+            ggtitle(paste0(v,'; Model Fit (BIC)')) +
+            scale_x_continuous(breaks=2:nmaxdmms)
+      )
+    
+    plot(ps)
+    
+    dmm_cs_mix = dmm_cs_fit[[which.min(dmm_cs_lplc$Laplace)]] %>%
+        mixture()
+    
+    dmm_cs_vec = dmm_cs_mix %>%
+        apply(1, which.max) %>%
+        paste0('cs.DMM', .) %>%
+        setNames(rownames(dmm_cs_mix))
+
+    dmm_cs_meta[,cs.DMM := dmm_cs_vec[sample_name]]
+
+    ## Build grid of DMMs based on enrollment_id
+    dmm_cs_grid = dmm_cs_meta[, .(visit, enrollment_id, cs.DMM)] %>%
+        data.table::dcast(enrollment_id ~ visit, value.var = 'cs.DMM') %>%
+        setkey(enrollment_id)
+    
+    return(dmm_cs_grid)
+})
+
+
+dmm_cs_grid = lapply(dmm_cs_gridlist,
+    function(x) x[filtered_metadata[,enrollment_id] %>% unique() %>% na.omit(),-1]
+) %>%
+    do.call('cbind', .) %>%
+    cbind(enrollment_id = filtered_metadata[,enrollment_id] %>% unique() %>% na.omit(),.) %>%
+    setkey(enrollment_id)
+```
+
+Bind tables together into a single dataset for multinomial logistic regression.
+```{r BindAllTables}
+
+## Alpha diveristy
+alphadivrows = alphadivnona[!is.na(visit)
+    , .(visit, logSR = log(SR), logPD = log(PD), shannon, logitsimpson = logitlink(simpson), enrollment_id)]
+
+alphadivdata = alphadivrows %>%
+    data.table::dcast(enrollment_id ~ visit, value.var = c('logSR', 'logPD', 'shannon', 'logitsimpson')) %>%
+    setkey(enrollment_id)
+
+## Bind together.
+cs_dmm_bound = cbind(cross_sectional_metadata, dmm_cs_grid[cross_sectional_metadata[,enrollment_id],-1]) %>% setkey(enrollment_id)
+cs_dmm_data = cs_dmm_bound[dmm_cs_grid[,unique(enrollment_id)],]
+colnames(cs_dmm_data) = make.names(colnames(cs_dmm_data))
+
+cs_dmm_data[,agediff_2moNB := age_2mo - age_NB]
+cs_dmm_data[,agediff_4mo2mo := age_4mo - age_2mo]
+
+## Create a dummy var
+cs_dmm_data[,dummyvar := sample(1:.N, .N)]
+
+## Factor character vars
+cs_dmm_data[,country := factor(country)]
+cs_dmm_data[,Seroconverted := factor(Seroconverted)]
+cs_dmm_data[,formula_bm_NB := factor(formula_bm_NB)]
+cs_dmm_data[,formula_bm_2mo := factor(formula_bm_2mo)]
+cs_dmm_data[,formula_bm_4mo := factor(formula_bm_4mo)]
+cs_dmm_data[,delivery := factor(delivery)]
+
+```
+
+# Community Barplots
+## Newborn bars
+We're very interested in the composition of each of the DMMs. Notably, DMM3 is dominated by Klebsiella with comparatively low Bifidobacterium. Based on the DAA results, this is the DMM that should respond poorly to the vaccine.
+```{r}
+library('ggplot2')
+library('RColorBrewer')
+
+set.seed(123) ## Re-set the seed for the palette
+
+cs_dmm_data[,NB := as.factor(as.character(NB))]
+
+sams = filtered_metadata[visit == 'NB' & enrollment_id %in% cs_dmm_data[!is.na(NB), enrollment_id], sample_name]
+enrolls = filtered_metadata[sams, enrollment_id]
+collapse_thresh = 0.2
+collapse_str = paste0('<', (collapse_thresh * 100),'%')
+
+dmm_NB_spp = gen_counts[,sams] %>%
+    apply(2, function(x) x/sum(x)) %>%
+    t()
+
+rownames(dmm_NB_spp) = enrolls
+
+dmm_NB_spp_melt = melt(dmm_NB_spp) %>% as.data.table()
+ncoll_spp = dmm_NB_spp_melt[value > collapse_thresh, Var2] %>%
+    unique() %>%
+    as.character()
+
+
+breaks = c(ncoll_spp, collapse_str)
+n = length(ncoll_spp)
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)) %>%
+    unlist()
+
+colpal = sample(col_vector, n) %>%
+    c(. , '#AAAAAA') %>%
+    setNames(., breaks)
+
+dmm_NB_spp_coll = dmm_NB_spp_melt[!(Var2 %in% ncoll_spp)
+                                  , .(Var2 = collapse_str
+                                  , value =  sum(value)), by = Var1][,.(Var1, Var2, value)] %>%
+    rbind(dmm_NB_spp_melt[(Var2 %in% ncoll_spp),],.)
+
+dmm_NB_spp_plot = setkey(copy(cs_dmm_data), enrollment_id)[dmm_NB_spp_coll[,Var1] %>% as.character(),] %>%
+    cbind(dmm_NB_spp_coll,.)
+
+
+ggplot() + 
+    geom_bar(aes(fill=factor(Var2, levels = breaks), y=value, x=Var1)
+             , data = dmm_NB_spp_plot, position="stack", stat="identity") +
+    facet_wrap(~NB, scales = 'free_x') + theme_bw() +
+    theme(axis.text.x = element_blank()) +
+    scale_fill_manual(values = colpal, breaks = breaks)
+
+
+```
+
+## 2-month bars
+```{r}
+library('ggplot2')
+library('RColorBrewer')
+cs_dmm_data[,X2mo := as.factor(as.character(X2mo))]
+
+sams = filtered_metadata[visit == '2mo' & enrollment_id %in% cs_dmm_data[!is.na(X2mo), enrollment_id], sample_name]
+enrolls = filtered_metadata[sams, enrollment_id]
+collapse_thresh = 0.2
+collapse_str = paste0('<', (collapse_thresh * 100),'%')
+dmm_2mo_spp = gen_counts[,sams] %>%
+    apply(2, function(x) x/sum(x)) %>%
+    t()
+
+rownames(dmm_2mo_spp) = enrolls
+
+dmm_2mo_spp_melt = melt(dmm_2mo_spp) %>% as.data.table()
+ncoll_spp = dmm_2mo_spp_melt[value > collapse_thresh, Var2] %>%
+    unique() %>%
+    as.character()
+
+dmm_2mo_spp_coll = dmm_2mo_spp_melt[!(Var2 %in% ncoll_spp)
+                                  , .(Var2 = collapse_str
+                                  , value =  sum(value)), by = Var1][,.(Var1, Var2, value)] %>%
+    rbind(dmm_2mo_spp_melt[(Var2 %in% ncoll_spp),],.)
+
+dmm_2mo_spp_plot = setkey(copy(cs_dmm_data), enrollment_id)[dmm_2mo_spp_coll[,Var1] %>% as.character(),] %>%
+    cbind(dmm_2mo_spp_coll,.)
+
+
+ggplot() + 
+    geom_bar(aes(fill=factor(Var2, levels = breaks), y=value, x=Var1)
+             , data = dmm_2mo_spp_plot, position="stack", stat="identity") +
+    facet_wrap(~X2mo, scales = 'free_x') + theme_bw() +
+    theme(axis.text.x = element_blank()) +
+    scale_fill_manual(values = colpal, breaks = breaks)
+
+
+```
+
+## 4-month bars
+```{r}
+library('ggplot2')
+library('RColorBrewer')
+cs_dmm_data[,X4mo := as.factor(as.character(X4mo))]
+
+sams = filtered_metadata[visit == '4mo' & enrollment_id %in% cs_dmm_data[!is.na(X4mo), enrollment_id], sample_name]
+enrolls = filtered_metadata[sams, enrollment_id]
+collapse_thresh = 0.2
+collapse_str = paste0('<', (collapse_thresh * 100),'%')
+
+dmm_4mo_spp = gen_counts[,sams] %>%
+    apply(2, function(x) x/sum(x)) %>%
+    t()
+
+rownames(dmm_4mo_spp) = enrolls
+
+dmm_4mo_spp_melt = melt(dmm_4mo_spp) %>% as.data.table()
+ncoll_spp = dmm_4mo_spp_melt[value > collapse_thresh, Var2] %>%
+    unique() %>%
+    as.character()
+
+
+breaks = c(ncoll_spp, collapse_str)
+n = length(ncoll_spp)
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)) %>%
+    unlist()
+
+colpal = sample(col_vector, n) %>%
+    c(. , '#AAAAAA') %>%
+    setNames(., breaks)
+
+dmm_4mo_spp_coll = dmm_4mo_spp_melt[!(Var2 %in% ncoll_spp)
+                                  , .(Var2 = collapse_str
+                                  , value =  sum(value)), by = Var1][,.(Var1, Var2, value)] %>%
+    rbind(dmm_4mo_spp_melt[(Var2 %in% ncoll_spp),],.)
+
+dmm_4mo_spp_plot = setkey(copy(cs_dmm_data), enrollment_id)[dmm_4mo_spp_coll[,Var1] %>% as.character(),] %>%
+    cbind(dmm_4mo_spp_coll,.)
+
+
+ggplot() + 
+    geom_bar(aes(fill=factor(Var2, levels = breaks), y=value, x=Var1)
+             , data = dmm_4mo_spp_plot, position="stack", stat="identity") +
+    facet_wrap(~X4mo, scales = 'free_x') + theme_bw() +
+    theme(axis.text.x = element_blank()) +
+    scale_fill_manual(values = colpal, breaks = breaks)
+
+
+```
+
+## Tabulated results
+NB groups are roughly 50% except DMM6, which mostly contains responders. However, there is a lot to unpack. Association between DMM and response is unlikely to be direct, since delivery + country + etc modify the microbiome to a much greater extent than does seroconversion. So, we're going to run a multinomial logistic regression to see if these ratios represent something statistically significant.
+```{r Tabulate}
+
+## Tabulate outcomes by DMM.
+
+## NB seroconversion
+cs_dmm_data[,table(NB, Seroconverted)]
+cs_dmm_data[,table(NB, seropositive_pre)]
+cs_dmm_data[,table(NB, seropositive_post)]
+
+## Chisq
+cs_dmm_data[,chisq.test(NB, seropositive_pre)]
+cs_dmm_data[,chisq.test(NB, seropositive_post)]
+
+## 2mo seroconversion
+cs_dmm_data[,table(X2mo, Seroconverted)]
+cs_dmm_data[,table(X2mo, seropositive_pre)]
+cs_dmm_data[,table(X2mo, seropositive_post)]
+
+## 4mo, seroconversion
+cs_dmm_data[,table(X4mo, Seroconverted)]
+cs_dmm_data[,table(X4mo, seropositive_pre)]
+cs_dmm_data[,table(X4mo, seropositive_post)]
+
+## rota stool pcr
+cs_dmm_data[,table(NB, rota_stool_pcr)]
+cs_dmm_data[,table(X2mo, rota_stool_pcr)]
+cs_dmm_data[,table(X4mo, rota_stool_pcr)]
+
+```
+
+
+# Multinomial logistic regression on DMMs
+With our cross-sectional DMMs in hand, we can now probe the odds that an individual is within a particular DMM given country + delivery + etc. By including seroconversion as a factor in this analysis, we can discover if a particular DMM is associated with increased risk of response/nonresponse. This is different from other ecological analyses in that it is greatly relaxed; we do not expect a direct effect on the composition of the microbiome to be observed, but rather our hypothesis is that Seroconversion status is correlated with increased odds of being placed within a particular DMM at each timepoint.
+
+```{r MultinomFunctions}
+library('nnet')
+library('lemon')
+assign_stars = function(pvalues) ifelse(pvalues < 0.1, '.','n.s.') %>%
+                 ifelse(pvalues < 0.05, '*',.) %>%
+                 ifelse(pvalues < 1e-2, '**',.) %>%
+                 ifelse(pvalues < 1e-3, '***',.)
+
+assign_stars2 = function(pvalues) ifelse(pvalues < 0.05, '*', 'n.s.')
+
+## Run a wald test on the multinomial logistic regression.
+wald.test.multinom = function(glmfit, predictor)
+{
+    ## Wald test; Calculate z-scores for estimates using parameters
+    zvalues = (summary(glmfit)$coefficients / summary(glmfit)$standard.errors)
+    pvalues = zvalues[,predictor] %>%
+        sapply(function(z) 2 * min(pnorm(z), pnorm(z, lower.tail = FALSE)))
+    
+    ## Newborn DMMs
+    out = data.frame(pval = pvalues
+             , OR = exp(summary(glmfit)$coefficients[,predictor])
+             , coef = summary(glmfit)$coefficients[,predictor]
+             , se = summary(glmfit)$standard.errors[,predictor]
+             , signif = assign_stars(pvalues)
+    )
+    
+    colnames(out)[2] = 'OR'
+    colnames(out)[3] = 'coef'
+    colnames(out)[4] = 'se'
+    out
+}
+
+barplot_multinom = function(obj, var)
+{
+    test = wald.test.multinom(obj, var)
+    coef = test$coef
+    pval = test$pval
+    se = test$se
+    group = rownames(test)
+    df = data.frame(m = coef, pval, group
+        ,   ci.95.min = coef - 2 * se
+        ,  ci.95.max = coef + 2 * se
+    )
+    df$signif = assign_stars2(pval)
+    barplot_multinom__ = ggplot(data = df) +
+        #geom_hline(yintercept = 0, linetype='dotted', color = '#555555', size = 1.5) +
+        geom_bar(aes(x = group, y = m, fill = signif), stat = 'identity') +
+        geom_segment(aes(x = group, xend = group, y = ci.95.min, yend = ci.95.max)) +
+        theme_minimal() +
+        scale_y_continuous() +
+        theme(legend.position = "bottom")
+    return(barplot_multinom__)
+}
+
+```
+
+## Binary response : (i.e.: responder vs non)
+Here, we run the multinomial logistic regression on the DMM, including covariates that based on our beta diversity analyses and the literature we know impact microbiome composition. This analysis reveals a statistically significant association between the NB gut type and seroconversion status. To wit: after accounting for other variation, ORV responders are 21 times less likely to be in DMM3 at NB than in DMM6 at NB. There are other gut types with significant differences, but the DMM3/DMM6 divide is the most stark. Using a first-order autoregression, we can probe this relationship over time as well, although this reveals no significant patterns at 2mo or 4mo.
+
+### With reference level set to DMM3
+```{r BinaryResponseMultinom, fig.width=4, fig.height = 5}
+## Multinomial reg to understand the influences of each var on DMMs
+glmfit = multinom(relevel(factor(NB), ref='cs.DMM3') ~ country + delivery +
+                      formula_bm_NB + age_NB +
+                      Seroconverted
+    , cs_dmm_data, na.action = 'na.omit')
+glmfit %>% Anova(type='III')
+
+seroconverted_pdmm3_NB = wald.test.multinom(glmfit, 'SeroconvertedResponder')
+seroconverted_pdmm3_NB_plot = barplot_multinom(glmfit, 'SeroconvertedResponder') +
+    ggtitle('Seroconversion, DMM3 vs. other DMMs') +
+    xlab('NB DMM') +
+    ylab('log(Odds-ratio) increase in seroconverted/responder')
+
+knitr::kable(seroconverted_pdmm3_NB)
+
+lm(dummyvar ~ NB + country + delivery + factor(formula_bm_2mo) +
+       gest_age + agediff_2moNB + Seroconverted
+   , cs_dmm_data, na.action = 'na.omit') %>% vif()
+
+glmfit = multinom(X2mo ~ NB + country + delivery + factor(formula_bm_2mo) +
+                      gest_age + agediff_2moNB + Seroconverted
+    , cs_dmm_data, na.action = 'na.omit')
+glmfit %>% Anova(type='III')
+
+lm(dummyvar ~ X2mo + country + delivery + factor(formula_bm_4mo) +
+       gest_age + agediff_4mo2mo + Seroconverted
+    , cs_dmm_data, na.action = 'na.omit') %>% vif()
+
+glmfit = multinom(X4mo ~ X2mo + country + delivery + factor(formula_bm_4mo) +
+                      gest_age + agediff_4mo2mo + Seroconverted
+    , cs_dmm_data, na.action = 'na.omit')
+glmfit %>% Anova(type='III')
+
+
+plot(seroconverted_pdmm3_NB_plot)
+```
+
+### Binary response with reference level set to DMM6
+```{r BinaryResponseMultinom2, fig.width=4, fig.height = 5}
+glmfit = multinom(relevel(factor(NB), ref='cs.DMM6') ~ country + delivery +
+                      factor(formula_bm_NB) + gest_age + age_NB +
+                      Seroconverted
+                , cs_dmm_data, na.action = 'na.omit')
+seroconverted_pdmm6_NB = wald.test.multinom(glmfit, 'SeroconvertedResponder')
+seroconverted_pdmm6_NB_plot = barplot_multinom(glmfit, 'SeroconvertedResponder') +
+    ggtitle('Seroconversion, DMM6 vs. other DMMs') +
+    xlab('NB DMM') +
+    ylab('log(Odds-ratio) increase in seroconverted/responder')
+
+knitr::kable(seroconverted_pdmm6_NB)
+seroconverted_pdmm6_NB_plot
+```
+
+## RV Shedding response with reference level set to DMM3
+Given that there is a significant relationship between DMM6/DMM3 and seroconversion, the question is -- does this apply to our secondary metric for ORV response, that is, whether or not RV was detected in the stool via PCR? We run the same model, using rotavirus shedding at 4 months as the outcome. We observe a statistically significant relationship here as well. Paradoxically, however, DMM3 is less likely to shed at 4mo, indicating a successful 2mo vaccine; each unit increase in shedding corresponds to a 2-3 unit increase in the likelihood that an individual has one of the other DMMs at NB. This pattern does not hold for the 2mo and 4mo datasets. This is not the case for DMM6 vs others, however; only DMM3 displays decreased stool shedding at 4mo.
+
+```{r BinaryStoolPCRMultinom, fig.width=4, fig.height = 5}
+## NB
+lm(dummyvar ~ country + factor(formula_bm_NB) + delivery + gest_age +
+       age_NB + rota_stool_pcr
+, cs_dmm_data, na.action = 'na.omit') %>% vif()
+
+glmfit = multinom(relevel(factor(NB), ref='cs.DMM3') ~ country + delivery +
+                      factor(formula_bm_NB) + gest_age + age_NB +
+                      rota_stool_pcr
+                  , cs_dmm_data, na.action = 'na.omit')
+glmfit %>% Anova(type='III')
+
+stool_pcr_pdmm3_NB = wald.test.multinom(glmfit, 'rota_stool_pcrPositive')
+stool_pcr_pdmm3_NB_plot = barplot_multinom(glmfit, 'rota_stool_pcrPositive') +
+    ggtitle('Stool PCR RV detection at 4mo, DMM3 vs. other DMMs') +
+    xlab('NB DMM') +
+    ylab('log(Odds-ratio) increase in shedding/positive')
+
+knitr::kable(stool_pcr_pdmm3_NB)
+plot(stool_pcr_pdmm3_NB_plot)
+
+glmfit = multinom(relevel(factor(NB), ref='cs.DMM6') ~ country + delivery +
+                      factor(formula_bm_NB) + gest_age + age_NB +
+                      rota_stool_pcr
+                  , cs_dmm_data, na.action = 'na.omit')
+glmfit %>% Anova(type='III')
+
+stool_pcr_pdmm6_NB = wald.test.multinom(glmfit, 'rota_stool_pcrPositive')
+stool_pcr_pdmm6_NB_plot = barplot_multinom(glmfit, 'rota_stool_pcrPositive') +
+    ggtitle('Stool PCR RV detection at 4mo, DMM6 vs. other DMMs') +
+    xlab('NB DMM') +
+    ylab('log(Odds-ratio) increase in shedding/positive')
+
+knitr::kable(stool_pcr_pdmm6_NB)
+plot(stool_pcr_pdmm6_NB_plot)
+
+## 2mo
+lm(dummyvar ~ NB + country + factor(formula_bm_2mo) + delivery + gest_age +
+       agediff_2moNB + rota_stool_pcr
+, cs_dmm_data, na.action = 'na.omit') %>% vif()
+
+glmfit = multinom(X2mo ~ NB + country + delivery + factor(formula_bm_2mo) +
+                      gest_age + agediff_2moNB + rota_stool_pcr
+                  , cs_dmm_data, na.action = 'na.omit')
+glmfit %>% Anova(type='III')
+
+## 4mo
+lm(dummyvar ~ X2mo + country + factor(formula_bm_4mo) + delivery + gest_age +
+       agediff_4mo2mo + rota_stool_pcr
+, cs_dmm_data, na.action = 'na.omit') %>% vif()
+
+glmfit = multinom(X4mo ~ X2mo + country + delivery + factor(formula_bm_4mo) +
+                      gest_age + agediff_4mo2mo + rota_stool_pcr
+                  , cs_dmm_data, na.action = 'na.omit')
+glmfit %>% Anova(type='III')
+
+```
+
+## Pre-RV IgA association
+Are there differences in pre-ORV IgA levels between DMMs? This is important to know because the seroconversion variable is itself a composite of pre- and post-ORV immune response states. Parker and colleagues found that pre-ORV immune state was an important factor in determining seroconversion status, so we must check to make sure that our DMMs are not just pointing to pre-vaccine state. We expect that a few of them will regardless.
+
+### With DMM3 as the ref level
+DMM3 is less likely to seroconvert. We select this as our first pivot. We find that (1) there are significant differences in association with pre-IgA levels between DMMs, and (2) that DMM6 is near-significant. Since we were going to use that as a second pivot anyway, we'll just use that.
+```{r RotaPreMultinom, fig.width = 4, fig.height = 5}
+
+## NB DMM3 pivot
+lm(dummyvar ~ country + factor(formula_bm_NB) + delivery + gest_age +
+       age_NB + log_pre_rota_sero_iga
+   , cs_dmm_data, na.action = 'na.omit') %>% vif()
+
+glmfit = multinom(relevel(factor(NB), ref='cs.DMM3') ~ country + factor(formula_bm_NB) + delivery +
+                      gest_age + age_NB + log_pre_rota_sero_iga
+                  , cs_dmm_data, na.action = 'na.omit')
+glmfit %>% Anova(type='III')
+
+pre_pdmm3_NB = wald.test.multinom(glmfit, 'log_pre_rota_sero_iga') 
+pre_pdmm3_NB %>% knitr::kable()
+pre_pdmm3_NB_plot = barplot_multinom(glmfit, 'log_pre_rota_sero_iga') +
+    ggtitle('Pre-ORV IgA, NB DMM3 vs. other DMMs') +
+    xlab('NB DMM') +
+    ylab('log(Odds-ratio) increase in log pre-ORV IgA')
+plot(pre_pdmm3_NB_plot)
+
+## DMM6 pivot
+glmfit = multinom(relevel(factor(NB), ref='cs.DMM6') ~ country + factor(formula_bm_NB) + delivery +
+                      gest_age + age_NB + log_pre_rota_sero_iga
+                  , cs_dmm_data, na.action = 'na.omit')
+
+pre_pdmm6_NB = wald.test.multinom(glmfit,'log_pre_rota_sero_iga') 
+pre_pdmm6_NB %>% knitr::kable()
+pre_pdmm6_NB_plot = barplot_multinom(glmfit,'log_pre_rota_sero_iga') +
+    ggtitle('Pre-ORV IgA, NB DMM6 vs. other DMMs') +
+    xlab('NB DMM') +
+    ylab('log(Odds-ratio) increase in log pre-ORV IgA')
+plot(pre_pdmm6_NB_plot)
+
+## 2mo
+
+lm(dummyvar ~ NB + country + factor(formula_bm_2mo) + delivery + gest_age +
+       agediff_2moNB + log_pre_rota_sero_iga
+   , cs_dmm_data, na.action = 'na.omit') %>% vif()
+
+glmfit = multinom(X2mo ~ NB + country + factor(formula_bm_2mo) + delivery +
+                      gest_age + agediff_2moNB + log_pre_rota_sero_iga
+                  , cs_dmm_data, na.action = 'na.omit')
+glmfit %>% Anova(type='III')
+
+pre_pdmm1_2mo = wald.test.multinom(glmfit,'log_pre_rota_sero_iga') 
+pre_pdmm1_2mo %>% knitr::kable()
+pre_pdmm1_2mo_plot = barplot_multinom(glmfit,'log_pre_rota_sero_iga') +
+    ggtitle('Pre-ORV IgA, 2mo DMM1 vs. other DMMs') +
+    xlab('2mo DMM') +
+    ylab('log(Odds-ratio) increase in log pre-ORV IgA')
+plot(pre_pdmm1_2mo_plot)
+
+```
+
+## Post-ORV IgA associaton
+Knowing that there are indeed differences in pre-vaccine IgA, we finally turn the multinomial logistic regression on the variable of interest: post-ORV IgA levels. We include pre-ORV IgA levels as a term in the model, but given that the 4mo timepoint is after the first measurement, it's important that, for the sake of understanding the relative risk associated with pre-ORV IgA we consider only the previous section. This is just for analyzing post in light of pre -- not post and pre both!
+
+Regardless, the results of this analysis recapitulate what we saw above with the binary variable; With increasing post-ORV IgA, the likelihood that an individual is in DMM6 increases, and DMM3 decreases. This suggests that these gut types have very different post responses, even after factoring in differences in pre-ORV IgA.
+
+### with DMM3 (high-klebs) as the ref level
+DMM3 exhibits significantly lower response IgA rates. We show that pre has some correlation with DMM at NB, possibly confounding our measure of post. To resolve this, we include both pre and post ORV IgA in the terms of the model, this time only concerned with the significance of post-ORV IgA. The relationship remains after adding pre-ORV IgA; each decrease in post ORV IgA increases the likelihood that an individual is in DMM3 at NB.
+```{r RotaPostMultinom, fig.width=4, fig.height = 5}
+
+## NB
+lm(dummyvar ~ country + factor(formula_bm_NB) + delivery +
+       age_NB + log_post_rota_sero_iga + log_pre_rota_sero_iga
+   , cs_dmm_data, na.action = 'na.omit') %>% vif()
+
+glmfit = multinom(relevel(factor(NB), ref='cs.DMM3') ~ country + factor(formula_bm_NB) + delivery +
+                      age_NB +
+                      log_post_rota_sero_iga + log_pre_rota_sero_iga
+                  , cs_dmm_data, na.action = 'na.omit')
+glmfit %>% Anova(type='III')
+
+post_pdmm3_NB = wald.test.multinom(glmfit, 'log_post_rota_sero_iga') 
+post_pdmm3_NB%>% knitr::kable()
+post_pdmm3_NB_plot = barplot_multinom(glmfit, 'log_post_rota_sero_iga') +
+    ggtitle('Post-ORV IgA, DMM3 vs. other DMMs') +
+    xlab('NB DMM') +
+    ylab('log(Odds-ratio) increase in log post-ORV IgA')
+
+## 2mo
+lm(dummyvar ~ NB + country + factor(formula_bm_2mo) + delivery +
+       gest_age + agediff_2moNB + log_post_rota_sero_iga +
+       log_pre_rota_sero_iga
+   , cs_dmm_data, na.action = 'na.omit') %>% vif()
+
+glmfit = multinom(X2mo ~ NB + country + factor(formula_bm_2mo) + delivery +
+                      gest_age + agediff_2moNB +
+                      log_post_rota_sero_iga + log_pre_rota_sero_iga
+                  , cs_dmm_data, na.action = 'na.omit')
+glmfit %>% Anova(type='III')
+
+## 4mo
+
+lm(dummyvar ~ X2mo + country + factor(formula_bm_4mo) + delivery + gest_age + agediff_4mo2mo + log_post_rota_sero_iga + log_pre_rota_sero_iga, cs_dmm_data, na.action = 'na.omit') %>% vif()
+
+glmfit = multinom(X4mo ~ X2mo + country + factor(formula_bm_4mo) + delivery + gest_age + agediff_4mo2mo + log_post_rota_sero_iga + log_pre_rota_sero_iga, cs_dmm_data, na.action = 'na.omit')
+glmfit %>% Anova(type='III')
+
+
+post_pdmm3_NB_plot
+
+```
+
+### With DMM6 as the ref level
+```{r RotaPostMultinom2, fig.width=4, fig.height = 5}
+## NB
+lm(dummyvar ~ country + factor(formula_bm_NB) + delivery + gest_age +
+       age_NB + log_post_rota_sero_iga + log_pre_rota_sero_iga
+   , cs_dmm_data, na.action = 'na.omit') %>% vif()
+
+glmfit = multinom(relevel(factor(NB), ref='cs.DMM6') ~ country + factor(formula_bm_NB) + delivery +
+                      age_NB +
+                      log_post_rota_sero_iga + log_pre_rota_sero_iga
+                  , cs_dmm_data, na.action = 'na.omit')
+glmfit %>% Anova(type='III')
+
+post_pdmm6_NB = wald.test.multinom(glmfit, 'log_post_rota_sero_iga') 
+post_pdmm6_NB%>% knitr::kable()
+post_pdmm6_NB_plot = barplot_multinom(glmfit, 'log_post_rota_sero_iga') +
+    ggtitle('Post-ORV IgA, DMM6 vs. other DMMs') +
+    xlab('NB DMM') +
+    ylab('log(Odds-ratio) increase in log post-ORV IgA')
+
+post_pdmm6_NB_plot
+```
+
+# Associations between DMMs and other vars using Logistic & linear regressions
+Using our multinomial logistic regression, we've developed some exploratory hypotheses about the relationship between the gut microbiome and the response to ORV. We turn these back onto the data, incorporating them into our clinical ORV response regression model. We also run some logistic regressions to learn factors that may contribute to specific DMM membership.
+
+### Plot multinomial logistic regs
+```{r PlotMultinomialDMM3, fig.width = 10, fig.height = 5}
+plot_grid(plotlist = list(seroconverted_pdmm3_NB_plot, stool_pcr_pdmm3_NB_plot))
+plot_grid(plotlist = list(pre_pdmm3_NB_plot, post_pdmm3_NB_plot))
+```
+
+```{r PlotMultinomialDMM6, fig.width = 10, fig.height = 5}
+plot_grid(plotlist = list(seroconverted_pdmm6_NB_plot, stool_pcr_pdmm6_NB_plot))
+plot_grid(plotlist = list(pre_pdmm6_NB_plot, post_pdmm6_NB_plot))
+```
+
+## Logistic regression to identify significant contributors to DMM3 and DMM6
+Quite a few of the DMMs are different in terms of response, suggesting some connection between DMM3 and ORV nonresponse. DMM6 has a high proportion of responders as compared to other DMMs. Here, we run additional logistic regressions to pick clinical and demographic risk factors that we know alter the microbiome that are also associated with membership in DMM3/DMM6.
+```{r}
+## Find association between covars and DMM3/DMM6
+cs_dmm_data[, NB.DMM3 := (NB == 'cs.DMM3')*1]
+cs_dmm_data[, NB.DMM2 := (NB == 'cs.DMM2')*1]
+cs_dmm_data[, NB.DMM6 := (NB == 'cs.DMM6')*1]
+cs_dmm_data[, NB.DMM1 := (NB == 'cs.DMM1')*1]
+
+## Covars contributing to NB DMM3 (vs all other DMMs)
+modl_nb_covars = glm(NB.DMM3 ~ country + delivery + formula_bm_NB + age_NB, data = cs_dmm_data, family = binomial)
+vif(modl_nb_covars)
+summary(modl_nb_covars)
+
+## Covars contributing to NB DMM6 (vs all other DMMs)
+modl_nb_covars = glm(NB.DMM6 ~ country + delivery + formula_bm_NB + age_NB, data = cs_dmm_data, family = binomial)
+vif(modl_nb_covars)
+summary(modl_nb_covars)
+
+## Covars contributing to NB DMM1 (vs all other DMMs)
+modl_nb_covars = glm(NB.DMM1 ~ country + delivery + formula_bm_NB + age_NB, data = cs_dmm_data, family = binomial)
+vif(modl_nb_covars)
+summary(modl_nb_covars)
+
+
+## Covars contributing to NB DMM2 (vs all other DMMs)
+modl_nb_covars = glm(NB.DMM2 ~ country + delivery + formula_bm_NB + age_NB, data = cs_dmm_data, family = binomial)
+vif(modl_nb_covars)
+summary(modl_nb_covars)
+
+
+```
+# Differential abundance
+## Differential Abundance
+Here, we run differential abundance analysis on our DMMS to understand the differences in composition between groups. Differential abundance testing using ANCOMBC2 confirms what we can see visually: DMM3 is high in Klebsiella, and low in Bifidobacterium (as well as a few other taxa). DMM6, on the other hand, is lower in Escherichia (and other Enterobacteriaceae) and higher in Bifidobacterium.
+```{r }
+library('ANCOMBC')
+library('mia')
+library('phyloseq')
+
+sams = metadata[visit == 'NB' & enrollment_id %in% cs_dmm_data[!is.na(NB), enrollment_id], sample_name]
+
+physeq_decon = merge_phyloseq(otudecon[,sams]
+                            , taxdecon
+                            , sample_data(samdf)[sams,])
+tse_decon = makeTreeSEFromPhyloseq(physeq_decon)
+tse_spp = agglomerateByRank(tse_decon, rank = 'Genus')
+
+## Log-library size is a normal distribution.
+colData(tse_spp)$log_library_size = colSums(assay(tse_spp, "counts")) %>% log()
+
+countries = metadata[,country] %>% unique() %>% na.omit()
+visits = metadata[,visit] %>% unique() %>% na.omit()
+
+tse_sero = tse_spp[, !is.na(tse_decon$Seroconverted)] ## we have pre and post both
+tse_sero_subset = tse_sero %>% subsetByPrevalentFeatures(prevalence = 0.1)
+tse_sero_subset = tse_sero_subset[(rowSums(tse_sero_subset %>% assay() %>% apply(2, function(x) x/sum(x)) >= 0.01) > 0) %>% which(),]
+colData(tse_sero_subset)$log_rota_sero_iga_fc = log(colData(tse_sero_subset)$rota_sero_iga_fc)
+colData(tse_sero_subset)$log_pre_rota_sero_iga = log(colData(tse_sero_subset)$pre_rota_sero_iga)
+colData(tse_sero_subset)$log_post_rota_sero_iga = log(colData(tse_sero_subset)$post_rota_sero_iga)
+colData(tse_sero_subset)$NB = setkey(copy(cs_dmm_data),enrollment_id)[colData(tse_sero_subset)$enrollment_id, NB]
+
+execute_ancombc2 = function(x, fix_formula, rand_formula = NULL, group)
+{
+    neg_lb = FALSE
+    ancombc2(data = x
+        , assay.type = "counts"
+        , fix_formula = fix_formula
+        , rand_formula = rand_formula
+        , p_adj_method = "fdr"
+        , group = group
+        , pairwise = TRUE
+        , struc_zero = TRUE
+        , neg_lb = TRUE
+        , alpha = 0.05
+        , global = TRUE
+    )
+}
+
+## Low-seroconversion group.
+colData(tse_sero_subset)$NB = relevel(factor(colData(tse_sero_subset)$NB), ref = 'cs.DMM3')
+ancombc2_dmm3 = execute_ancombc2(
+      x = tse_sero_subset
+    , fix_formula = 'NB + country + delivery + formula_bm + age + log_library_size'
+    , group = 'NB'
+)
+
+## Relevel and run with the high-seroconversion group.
+colData(tse_sero_subset)$NB = relevel(factor(colData(tse_sero_subset)$NB), ref = 'cs.DMM6')
+ancombc2_dmm6 = execute_ancombc2(
+      x = tse_sero_subset
+    , fix_formula = 'NB + country + delivery + formula_bm + age + log_library_size'
+    , group = 'NB'
+)
+
+```
+
+```{r DAvsDMM3, fig.width=10, fig.height=4}
+dmms = cs_dmm_data[,NB] %>% unique() %>% na.omit() %>% setdiff('cs.DMM3')
+
+dmmdiffs = lapply(dmms, function(dmm)
+{
+    res = ancombc2_dmm3$res %>%
+        dplyr::select(taxon, c(paste0('lfc_NB', dmm)
+                           , paste0('se_NB', dmm)
+                           , paste0('p_NB', dmm)
+                           , paste0('q_NB', dmm))) %>%
+        as.data.table()
+    colnames(res) = c('taxon', 'l2fc', 'se', 'p', 'q')
+    res$group = dmm
+    res$signif =  ifelse(res$q < 0.1, '.', '') %>% ifelse(res$q < 0.05, '*', .) 
+    return(res)
+}) %>% do.call('rbind',.)
+dmmdiffs$ref = 'cs.DMM3'
+
+anydifftax = dmmdiffs[signif != '', taxon] %>% unique()
+
+ggplot(data = dmmdiffs[taxon %in% anydifftax,]) +
+    geom_bar(aes(x = l2fc, y = taxon, fill = signif), stat = 'identity') +
+    geom_segment(aes(x = (l2fc - 2*se), xend = (l2fc + 2*se), y = taxon, yend = taxon)) +
+    facet_grid(~ group, scale = 'fixed', space = 'fixed') +
+    theme_bw() + ggtitle(paste0('vs. ', 'cs.DMM3'))
+
+```
+
+```{r DAvsDMM6, fig.width=10, fig.height=4}
+dmms = cs_dmm_data[,NB] %>% unique() %>% na.omit() %>% setdiff('cs.DMM6')
+
+dmmdiffs = lapply(dmms, function(dmm)
+{
+    res = ancombc2_dmm6$res %>%
+        dplyr::select(taxon, c(paste0('lfc_NB', dmm)
+                           , paste0('se_NB', dmm)
+                           , paste0('p_NB', dmm)
+                           , paste0('q_NB', dmm))) %>%
+        as.data.table()
+    colnames(res) = c('taxon', 'l2fc', 'se', 'p', 'q')
+    res$group = dmm
+    res$signif = ifelse(res$q < 0.1, '.', '') %>% ifelse(res$q < 0.05, '*', .) 
+    return(res)
+}) %>% do.call('rbind',.)
+dmmdiffs$ref = 'cs.DMM6'
+
+anydifftax = dmmdiffs[signif != '', taxon] %>% unique()
+dmmdiffs[order(l2fc) %>% rev(), taxon := factor(taxon, levels = unique(taxon))]
+
+ggplot(data = dmmdiffs[taxon %in% anydifftax,]) +
+    geom_bar(aes(x = l2fc, y = taxon, fill = signif), stat = 'identity') +
+    geom_segment(aes(x = (l2fc - 2*se), xend = (l2fc + 2*se), y = taxon, yend = taxon)) +
+    facet_grid(~group, scale = 'fixed', space = 'fixed') +
+    theme_bw() + ggtitle(paste0('vs. ', 'cs.DMM6'))
+
+```
+
+## VS 2mo
+We see differences at the 2mo based on NB that are significant. Run ANCOMBC2.
+```{r }
+sams = metadata[visit == '2mo' & enrollment_id %in% cs_dmm_data[!is.na(NB) & !is.na(X2mo), enrollment_id], sample_name]
+
+physeq_decon = merge_phyloseq(otudecon[,sams]
+                            , taxdecon
+                            , sample_data(samdf)[sams,])
+tse_decon = makeTreeSEFromPhyloseq(physeq_decon)
+tse_spp = agglomerateByRank(tse_decon, rank = 'Genus')
+
+## Log-library size is a normal distribution.
+colData(tse_spp)$log_library_size = colSums(assay(tse_spp, "counts")) %>% log()
+
+tse_sero = tse_spp[, !is.na(tse_decon$Seroconverted)] ## we have pre and post both
+tse_sero_subset = tse_sero %>% subsetByPrevalentFeatures(prevalence = 0.1)
+tse_sero_subset = tse_sero_subset[(rowSums(tse_sero_subset %>% assay() %>% apply(2, function(x) x/sum(x)) >= 0.01) > 0) %>% which(),]
+colData(tse_sero_subset)$log_rota_sero_iga_fc = log(colData(tse_sero_subset)$rota_sero_iga_fc)
+colData(tse_sero_subset)$log_pre_rota_sero_iga = log(colData(tse_sero_subset)$pre_rota_sero_iga)
+colData(tse_sero_subset)$log_post_rota_sero_iga = log(colData(tse_sero_subset)$post_rota_sero_iga)
+colData(tse_sero_subset)$NB = setkey(copy(cs_dmm_data),enrollment_id)[colData(tse_sero_subset)$enrollment_id, NB]
+colData(tse_sero_subset)$X2mo = setkey(copy(cs_dmm_data),enrollment_id)[colData(tse_sero_subset)$enrollment_id, X2mo]
+
+## Correlated with NB DMM 3
+colData(tse_sero_subset)$NB = relevel(factor(colData(tse_sero_subset)$NB), ref = 'cs.DMM3')
+ancombc2_dmm3_2mo = execute_ancombc2(
+      x = tse_sero_subset
+    , fix_formula = 'NB + country + delivery + formula_bm + age + log_library_size'
+    , group = 'NB'
+)
+colData(tse_sero_subset)$NB = relevel(factor(colData(tse_sero_subset)$NB), ref = 'cs.DMM6')
+ancombc2_dmm6_2mo = execute_ancombc2(
+      x = tse_sero_subset
+    , fix_formula = 'NB + country + delivery + formula_bm + age + log_library_size'
+    , group = 'NB'
+)
+```
+
+
+```{r 2movsDMM6}
+dmms = cs_dmm_data[,NB] %>% unique() %>% na.omit() %>% setdiff('cs.DMM6')
+
+dmmdiffs = lapply(dmms, function(dmm)
+{
+    res = ancombc2_dmm6_2mo$res %>%
+        dplyr::select(taxon, c(paste0('lfc_NB', dmm)
+                           , paste0('se_NB', dmm)
+                           , paste0('p_NB', dmm)
+                           , paste0('q_NB', dmm))) %>%
+        as.data.table()
+    colnames(res) = c('taxon', 'l2fc', 'se', 'p', 'q')
+    res$group = dmm
+    res$signif = ifelse(res$q < 0.1, '.', '') %>% ifelse(res$q < 0.05, '*', .) 
+    return(res)
+}) %>% do.call('rbind',.)
+dmmdiffs$ref = 'cs.DMM6'
+
+anydifftax = dmmdiffs[signif != '', taxon] %>% unique()
+dmmdiffs[order(l2fc) %>% rev(), taxon := factor(taxon, levels = unique(taxon))]
+
+ggplot(data = dmmdiffs[taxon %in% anydifftax,]) +
+    geom_bar(aes(x = l2fc, y = taxon, fill = signif), stat = 'identity') +
+    geom_segment(aes(x = (l2fc - 2*se), xend = (l2fc + 2*se), y = taxon, yend = taxon)) +
+    facet_grid(~group, scale = 'fixed', space = 'fixed') +
+    theme_bw() + ggtitle(paste0('vs. ', 'NB cs.DMM6'))
+```
+
+```{r 2movsDMM3}
+dmms = cs_dmm_data[,NB] %>% unique() %>% na.omit() %>% setdiff('cs.DMM3')
+
+dmmdiffs = lapply(dmms, function(dmm)
+{
+    res = ancombc2_dmm6_2mo$res %>%
+        dplyr::select(taxon, c(paste0('lfc_NB', dmm)
+                           , paste0('se_NB', dmm)
+                           , paste0('p_NB', dmm)
+                           , paste0('q_NB', dmm))) %>%
+        as.data.table()
+    colnames(res) = c('taxon', 'l2fc', 'se', 'p', 'q')
+    res$group = dmm
+    res$signif = ifelse(res$q < 0.1, '.', '') %>% ifelse(res$q < 0.05, '*', .) 
+    return(res)
+}) %>% do.call('rbind',.)
+dmmdiffs$ref = 'cs.DMM3'
+
+anydifftax = dmmdiffs[signif != '', taxon] %>% unique()
+dmmdiffs[order(l2fc) %>% rev(), taxon := factor(taxon, levels = unique(taxon))]
+
+ggplot(data = dmmdiffs[taxon %in% anydifftax,]) +
+    geom_bar(aes(x = l2fc, y = taxon, fill = signif), stat = 'identity') +
+    geom_segment(aes(x = (l2fc - 2*se), xend = (l2fc + 2*se), y = taxon, yend = taxon)) +
+    facet_grid(~group, scale = 'fixed', space = 'fixed') +
+    theme_bw() + ggtitle(paste0('vs. ', 'NB cs.DMM3'))
+```
+
+# DMM-Diversity
+Knowing that there are differences between the DMMs, we run some diversity analyses to understand how the DMMs correspond to community structure: Alpha diversity and beta diversity analyses.
+
+## Alpha diversity
+This section probes the differences in alpha and beta diversity between DMMs. We did not find a significant difference between DMM3 and DMM6 with regard to alpha diversity -- this more or less agrees with our other analyses. There is no significant association between ORV response and alpha diversity at the timepoints that we analyzed.
+
+```{r AlphaDiv, fig.width=10, fig.height=4}
+
+assign_stars2 = function(pvalues) ifelse(pvalues < 0.05, '*', 'n.s.')
+
+plot.TukeyHSD = function(tukey.out, title = '')
+{
+  
+  tukey.out.dt = as.data.table(tukey.out[[1]], keep.rownames=TRUE)
+  tukey.out.dt[,c('a','b') := strsplit(rn, '-') %>% do.call('rbind',.) %>% as.data.table()]
+  
+  tukey.out.dt$signif = assign_stars2(tukey.out.dt[,`p adj`])
+  
+  ggplot(data = tukey.out.dt) +
+      geom_hline(yintercept = 0, linetype = 'dotted', color = '#777777') +
+      geom_segment(aes(x = b, xend = b, y = lwr, yend = upr)) +
+      geom_point(aes(x = b, y = diff, color = signif)) +
+      ylab('HSD') +
+      xlab('Subtrahend') +
+      facet_grid(~a, scale = 'free_x', space = 'free_x') +
+      theme_bw() +
+      theme(axis.text.x = element_text(angle=  45, hjust = 1, vjust = 1))  +
+      theme(strip.clip = "off", strip.background.x = element_blank()) +
+      ggtitle(title)
+}
+
+## Run alpha divs
+alphadivdmm = setkey(metadata[alphadivs,][visit == 'NB',], enrollment_id)[cs_dmm_data[!is.na(NB),enrollment_id],] %>% cbind(.,cs_dmm_data[!is.na(NB),])
+
+## Species richness
+srmodl = aov(log(SR) ~ NB, data = alphadivdmm, na.action = 'na.fail')
+srthsd = TukeyHSD(srmodl)
+plot.TukeyHSD(srthsd, 'OGU richness')
+
+## Faith's PD
+pdmodl = aov(log(PD) ~ NB, data = alphadivdmm, na.action = 'na.fail')
+pdthsd = TukeyHSD(pdmodl)
+plot.TukeyHSD(pdthsd, "Faith's PD")
+
+## Simpson
+simpsonmodl = aov(logitlink(simpson) ~ NB, data = alphadivdmm, na.action = 'na.fail')
+simpsonthsd = TukeyHSD(simpsonmodl)
+plot.TukeyHSD(simpsonthsd, 'Simpson')
+
+shannonmodl = aov(shannon ~ NB, data = alphadivdmm, na.action = 'na.fail')
+shannonthsd = TukeyHSD(shannonmodl)
+plot.TukeyHSD(shannonthsd, 'Shannon')
+
+```
+
+## Beta diversity
+We use this analysis to identify whether or not the beta diversity structure at each subsequent timepoint is correlated with the DMM at NB. We find that differences in community structure associated with DMM3 persist until 2-months, demonstrating that the low-response DMM gut may correlate with an immune/gut signature forward in time.
+```{r UUnifrac_SplitOnTime, fig.width = 10, fig.height = 4}
+library('vegan')
+library('rbiom')
+library('ape')
+library('compositions')
+
+g_legend <- function(a.gplot){ 
+    tmp <- ggplot_gtable(ggplot_build(a.gplot)) 
+    leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box") 
+    legend <- tmp$grobs[[leg]] 
+    legend
+}
+
+
+setkey(metadata, sample_name)
+visits = metadata[,visit] %>%
+    unique() %>%
+    na.omit()
+
+## Iterate adonis over visit number
+uwu_adonis_list = visits %>%
+    lapply(
+function(v)
+{
+    thisvisitsams = metadata[visit == v 
+                             & enrollment_id %in% alphadivdmm[!is.na(NB), enrollment_id]
+                            , sample_name] %>%
+        intersect(colnames(goodcounts))
+    thisvisitcounts = ogu_counts[,thisvisitsams]
+    
+    thisvisitmeta = setkey(alphadivdmm, enrollment_id)[metadata[thisvisitsams, enrollment_id],] %>%
+        setkey(sample_name)
+    
+    ## Generate new unweighted unifrac matrix representing the visit subset.
+    v_uwunifrac = rbiom::unifrac(thisvisitcounts, weighted = FALSE, tree = rwoltree)
+    
+    ## Call adonis2, sequential
+    ado = adonis2(v_uwunifrac ~ formula_bm + delivery + country + age + NB, data = thisvisitmeta
+                  , by ='terms'
+                  , permutations = how(nperm = 999)
+                  , na.action = 'na.omit')
+    
+    ## Draw PCoA
+    v_uwunifrac_pcoa_ord = pcoa(v_uwunifrac)
+
+    v_uwunifrac_pcoa_coords = v_uwunifrac_pcoa_ord$vectors
+    
+    v_uwunifrac_pcoa_data = thisvisitmeta %>% cbind(v_uwunifrac_pcoa_coords)
+    
+    ri = which(attributes(ado)$row.names == 'NB')
+    pval = ado$`Pr(>F)`[ri]
+    Fval = ado$`F`[ri]
+    p = (
+        ggplot(v_uwunifrac_pcoa_data) +
+            geom_point(aes(x = Axis.1, y = Axis.2, color = NB)
+                      , size = 2) +
+            stat_ellipse(aes(x = Axis.1, y = Axis.2, color = NB)) + 
+            annotate('text', label = paste0('Pr(>F) = ', pval , ifelse(pval < 0.05, '*','')
+                                            , '\n', 'F = ', round(Fval,1))
+                     , x = min(v_uwunifrac_pcoa_data$Axis.1) - 0.05
+                     , y = max(v_uwunifrac_pcoa_data$Axis.2) + 0.05
+                     , hjust = 0, vjust = 1) + 
+            theme_bw() +
+            theme(legend.position = 'none') +
+            ggtitle(paste0('Unwt UniFrac, NB DMMs at ', v)) 
+    )
+    return(list(adonis = ado, plot = p))
+}) %>% setNames(visits)
+
+uwu_adonis_list %>% lapply(function(x) print(x$adonis))
+
+pl = uwu_adonis_list %>% lapply(function(x) x$plot )
+pdf(file = NULL)
+    leg = g_legend(uwu_adonis_list[[1]]$plot + theme(legend.position = 'bottom'))
+silence({dev.off()})
+pl = c(pl, list(NULL, leg, NULL))
+
+plot_grid(plotlist = pl, nrow = 2, ncol = 3, rel_heights = c(0.8, 0.2))
+
+
+```
+
+```{r WUnifrac_SplitOnTime, fig.width = 10, fig.height = 4}
+
+setkey(metadata, sample_name)
+visits = metadata[,visit] %>%
+    unique() %>%
+    na.omit()
+
+## Iterate adonis over visit number
+wu_adonis_list = visits %>%
+    lapply(
+function(v)
+{
+    thisvisitsams = metadata[visit == v 
+                             & enrollment_id %in% alphadivdmm[!is.na(NB), enrollment_id]
+                            , sample_name] %>%
+        intersect(colnames(goodcounts))
+    thisvisitcounts = ogu_counts[,thisvisitsams]
+    
+    thisvisitmeta = setkey(alphadivdmm, enrollment_id)[metadata[thisvisitsams, enrollment_id],] %>%
+        setkey(sample_name)
+    
+    ## Generate new unweighted unifrac matrix representing the visit subset.
+    v_wunifrac = rbiom::unifrac(thisvisitcounts, weighted = TRUE, tree = rwoltree)
+    
+    ## Call adonis2, sequential
+    ado = adonis2(v_wunifrac ~ formula_bm + delivery + country + age + NB, data = thisvisitmeta
+                  , by ='terms'
+                  , permutations = how(nperm = 999)
+                  , na.action = 'na.omit')
+    
+    ## Draw PCoA
+    v_wunifrac_pcoa_ord = pcoa(v_wunifrac)
+
+    v_wunifrac_pcoa_coords = v_wunifrac_pcoa_ord$vectors
+    
+    v_wunifrac_pcoa_data = thisvisitmeta %>% cbind(v_wunifrac_pcoa_coords)
+    
+    ri = which(attributes(ado)$row.names == 'NB')
+    pval = ado$`Pr(>F)`[ri]
+    Fval = ado$`F`[ri]
+    p = (
+        ggplot(v_wunifrac_pcoa_data) +
+            geom_point(aes(x = Axis.1, y = Axis.2, color = NB)
+                      , size = 2) +
+            stat_ellipse(aes(x = Axis.1, y = Axis.2, color = NB)) + 
+            annotate('text', label = paste0('Pr(>F) = ', pval , ifelse(pval < 0.05, '*','')
+                                            , '\n', 'F = ', round(Fval,1))
+                     , x = min(v_wunifrac_pcoa_data$Axis.1) - 0.05
+                     , y = max(v_wunifrac_pcoa_data$Axis.2) + 0.05
+                     , hjust = 0, vjust = 1) + 
+            theme_bw() +
+            theme(legend.position = 'none') +
+            ggtitle(paste0('Wt UniFrac, NB DMMs at ', v)) 
+    )
+    return(list(adonis = ado, plot = p))
+}) %>% setNames(visits)
+
+wu_adonis_list %>% lapply(function(x) print(x$adonis))
+
+pl = wu_adonis_list %>% lapply(function(x) x$plot )
+pdf(file = NULL)
+    leg = g_legend(wu_adonis_list[[1]]$plot + theme(legend.position = 'bottom'))
+silence({dev.off()})
+pl = c(pl, list(NULL, leg, NULL))
+
+plot_grid(plotlist = pl, nrow = 2, ncol = 3, rel_heights = c(0.8, 0.2))
+
+
+## Iterate adonis over visit number, visit 2.
+wu_adonis_list_2mo = visits[-1] %>%
+    lapply(
+function(v)
+{
+    thisvisitsams = metadata[visit == v 
+                             & enrollment_id %in% alphadivdmm[!is.na(X2mo), enrollment_id]
+                            , sample_name] %>%
+        intersect(colnames(goodcounts))
+    thisvisitcounts = ogu_counts[,thisvisitsams]
+    
+    thisvisitmeta = setkey(alphadivdmm, enrollment_id)[metadata[thisvisitsams, enrollment_id],] %>%
+        setkey(sample_name)
+    
+    ## Generate new unweighted unifrac matrix representing the visit subset.
+    v_wunifrac = rbiom::unifrac(thisvisitcounts, weighted = FALSE, tree = rwoltree)
+    
+    ## Call adonis2, sequential
+    ado = adonis2(v_wunifrac ~ formula_bm + delivery + country + age + X2mo, data = thisvisitmeta
+                  , by ='terms'
+                  , permutations = how(nperm = 999)
+                  , na.action = 'na.omit')
+    
+    
+    ## Draw PCoA
+    v_wunifrac_pcoa_ord = pcoa(v_wunifrac)
+
+    v_wunifrac_pcoa_coords = v_wunifrac_pcoa_ord$vectors
+    
+    v_wunifrac_pcoa_data = thisvisitmeta %>% cbind(v_wunifrac_pcoa_coords)
+    
+    ri = which(attributes(ado)$row.names == 'X2mo')
+    pval = ado$`Pr(>F)`[ri]
+    Fval = ado$`F`[ri]
+    p = (
+        ggplot(v_wunifrac_pcoa_data) +
+            geom_point(aes(x = Axis.1, y = Axis.2, color = X2mo)
+                      , size = 2) +
+            stat_ellipse(aes(x = Axis.1, y = Axis.2, color = X2mo)) + 
+            annotate('text', label = paste0('Pr(>F) = ', pval , ifelse(pval < 0.05, '*','')
+                                            , '\n', 'F = ', round(Fval,1))
+                     , x = min(v_wunifrac_pcoa_data$Axis.1) - 0.05
+                     , y = max(v_wunifrac_pcoa_data$Axis.2) + 0.05
+                     , hjust = 0, vjust = 1) + 
+            theme_bw() +
+            theme(legend.position = 'none') +
+            ggtitle(paste0('Wt UniFrac, 2mo DMMs at ', v)) 
+    )
+    return(list(adonis = ado, plot = p))
+}) %>% setNames(visits[-1])
+
+wu_adonis_list %>% lapply(function(x) print(x$adonis))
+
+pl = wu_adonis_list_2mo %>% lapply(function(x) x$plot ) %>% c(., NULL)
+pdf(file = NULL)
+    leg = g_legend(wu_adonis_list_2mo[[1]]$plot + theme(legend.position = 'bottom'))
+silence({dev.off()})
+pl = c(pl, list(NULL, leg, NULL))
+
+plot_grid(plotlist = pl, nrow = 2, ncol = 3, rel_heights = c(0.8, 0.2))
+
+
+```
+
+```{r Aitchison_SplitOnTime, fig.width = 10, fig.height = 4}
+
+## This code just repeats what we did for the unifrac adonis + PCoA, except using clr-transformed counts to generate euclidean distance.
+
+## Iterate adonis over visit number
+aitch_adonis_list_NB = visits %>%
+    lapply(
+function(v)
+{
+    thisvisitsams = metadata[visit == v 
+                             & enrollment_id %in% alphadivdmm[!is.na(NB), enrollment_id]
+                            , sample_name] %>%
+        intersect(colnames(rarecounts))
+    
+    thisvisitcounts = spp_clr[thisvisitsams,]
+    
+    thisvisitmeta = setkey(alphadivdmm, enrollment_id)[metadata[thisvisitsams, enrollment_id],] %>%
+        setkey(sample_name)
+    
+    v_euclidean = vegdist(thisvisitcounts, method = 'euclidean')
+
+    
+    ## Call adonis2, sequential
+    ado = adonis2(v_euclidean ~ formula_bm + delivery + country + age + NB, data = thisvisitmeta
+                  , by = 'terms'
+                  , permutations = how(nperm = 999)
+                  , na.action = 'na.omit')
+    
+    ## Draw PCoA
+    v_euclidean_pcoa_ord = pcoa(v_euclidean)
+
+    v_euclidean_pcoa_coords = v_euclidean_pcoa_ord$vectors
+    
+    v_euclidean_pcoa_data = thisvisitmeta %>% cbind(v_euclidean_pcoa_coords)
+    
+    ri = which(attributes(ado)$row.names == 'NB')
+    pval = ado$`Pr(>F)`[ri]
+    Fval = ado$`F`[ri]
+    p = (
+        ggplot(v_euclidean_pcoa_data) +
+            geom_point(aes(x = Axis.1, y = Axis.2, color = NB)
+                      , size = 2) +
+            stat_ellipse(aes(x = Axis.1, y = Axis.2, color = NB)) + 
+            annotate('text', label = paste0('Pr(>F) = ', pval , ifelse(pval < 0.05, '*','')
+                                            , '\n', 'F = ', round(Fval,1))
+                     , x = min(v_euclidean_pcoa_data$Axis.1) - 0.05
+                     , y = max(v_euclidean_pcoa_data$Axis.2) + 0.05
+                     , hjust = 0, vjust = 1) + 
+            theme_bw() +
+            theme(legend.position = 'none') +
+            ggtitle(paste0('Aitchision, NB DMMs at ', v)) 
+    )
+    return(list(adonis = ado, plot = p))
+}) %>% setNames(visits)
+
+aitch_adonis_list_NB %>% lapply(function(x) print(x$adonis))
+pl = aitch_adonis_list_NB %>% lapply(function(x) x$plot ) %>% c(., NULL)
+pdf(file = NULL)
+    leg = g_legend(aitch_adonis_list_NB[[1]]$plot + theme(legend.position = 'bottom'))
+silence({dev.off()})
+pl = c(pl, list(NULL, leg, NULL))
+
+
+plot_grid(plotlist = pl, nrow = 2, ncol = 3, rel_heights = c(0.8, 0.2))
+
+aitch_adonis_list_2mo = visits[-1] %>%
+    lapply(
+function(v)
+{
+    thisvisitsams = metadata[visit == v 
+                             & enrollment_id %in% alphadivdmm[!is.na(X2mo), enrollment_id]
+                            , sample_name] %>%
+        intersect(colnames(rarecounts))
+    
+    thisvisitcounts = spp_clr[thisvisitsams,]
+    
+    thisvisitmeta = setkey(alphadivdmm, enrollment_id)[metadata[thisvisitsams, enrollment_id],] %>%
+        setkey(sample_name)
+    
+    v_euclidean = vegdist(thisvisitcounts, method = 'euclidean')
+
+        
+    ## Call adonis2, sequential
+    ado = adonis2(v_euclidean ~ formula_bm + delivery + country + age + X2mo, data = thisvisitmeta
+                  , by = 'terms'
+                  , permutations = how(nperm = 999)
+                  , na.action = 'na.omit')
+    
+    
+    ## Draw PCoA
+    v_euclidean_pcoa_ord = pcoa(v_euclidean)
+
+    v_euclidean_pcoa_coords = v_euclidean_pcoa_ord$vectors
+    
+    v_euclidean_pcoa_data = thisvisitmeta %>% cbind(v_euclidean_pcoa_coords)
+    
+    ri = which(attributes(ado)$row.names == 'X2mo')
+    pval = ado$`Pr(>F)`[ri]
+    Fval = ado$`F`[ri]
+    p = (
+        ggplot(v_euclidean_pcoa_data) +
+            geom_point(aes(x = Axis.1, y = Axis.2, color = X2mo)
+                      , size = 2) +
+            stat_ellipse(aes(x = Axis.1, y = Axis.2, color = X2mo)) + 
+            annotate('text', label = paste0('Pr(>F) = ', pval , ifelse(pval < 0.05, '*','')
+                                            , '\n', 'F = ', round(Fval,1))
+                     , x = min(v_euclidean_pcoa_data$Axis.1) - 0.05
+                     , y = max(v_euclidean_pcoa_data$Axis.2) + 0.05
+                     , hjust = 0, vjust = 1) + 
+            theme_bw() +
+            theme(legend.position = 'none') +
+            ggtitle(paste0('Aitchision, 2mo DMMs at ', v)) 
+    )
+    return(list(adonis = ado, plot = p))
+}) %>% setNames(visits[-1])
+
+aitch_adonis_list_2mo %>% lapply(function(x) print(x$adonis))
+pl = aitch_adonis_list_2mo %>% lapply(function(x) x$plot ) %>% c(., NULL)
+pdf(file = NULL)
+    leg = g_legend(aitch_adonis_list_2mo[[1]]$plot + theme(legend.position = 'bottom'))
+silence({dev.off()})
+pl = c(pl, list(NULL, leg, NULL))
+
+
+plot_grid(plotlist = pl, nrow = 2, ncol = 3, rel_heights = c(0.8, 0.2))
+
+```
+
+```{r Bray_SplitOnTime, fig.width = 10, fig.height = 4}
+
+## This code just repeats what we did for the unifrac adonis + PCoA, except using counts for bray-curtis dissimilarity.
+
+## Iterate adonis over visit number
+bray_adonis_list = visits %>%
+    lapply(
+function(v)
+{
+    thisvisitsams = metadata[visit == v 
+                             & enrollment_id %in% alphadivdmm[!is.na(NB), enrollment_id]
+                            , sample_name] %>%
+        intersect(colnames(goodcounts))
+    
+    thisvisitcounts = spp_counts[,thisvisitsams] %>% t()
+    
+    thisvisitmeta = setkey(alphadivdmm, enrollment_id)[metadata[thisvisitsams, enrollment_id],] %>%
+        setkey(sample_name)
+    
+    v_bray = vegdist(thisvisitcounts, method = 'bray')
+
+        
+    ## Call adonis2, sequential
+    ado = adonis2(v_bray ~ formula_bm + delivery + country + age + NB, data = thisvisitmeta
+                  , by = 'terms'
+                  , permutations = how(nperm = 999)
+                  , na.action = 'na.omit')
+    
+    
+        ## Draw PCoA
+    v_bray_pcoa_ord = pcoa(v_bray)
+
+    v_bray_pcoa_coords = v_bray_pcoa_ord$vectors
+    
+    v_bray_pcoa_data = thisvisitmeta %>% cbind(v_bray_pcoa_coords)
+    
+    ## Draw PCoA
+    ri = which(attributes(ado)$row.names == 'NB')
+    pval = ado$`Pr(>F)`[ri]
+    Fval = ado$`F`[ri]
+    p = (
+        ggplot(v_bray_pcoa_data) +
+            geom_point(aes(x = Axis.1, y = Axis.2, color = NB)
+                      , size = 2) +
+            stat_ellipse(aes(x = Axis.1, y = Axis.2, color = NB)) + 
+            annotate('text', label = paste0('Pr(>F) = ', pval , ifelse(pval < 0.05, '*','')
+                                            , '\n', 'F = ', round(Fval,1))
+                     , x = min(v_bray_pcoa_data$Axis.1) - 0.05
+                     , y = max(v_bray_pcoa_data$Axis.2) + 0.05
+                     , hjust = 0, vjust = 1) + 
+            theme_bw() +
+            theme(legend.position = 'none') +
+            ggtitle(paste0('Bray-Curtis, NB DMMs at ', v)) 
+    )
+    return(list(adonis = ado, plot = p))
+}) %>% setNames(visits)
+
+bray_adonis_list %>% lapply(function(x) print(x$adonis))
+pl = bray_adonis_list %>% lapply(function(x) x$plot )
+
+## This generates a plot window -- prevent that by redirecting to null output.
+pdf(file = NULL)
+    leg = g_legend(bray_adonis_list[[1]]$plot + theme(legend.position = 'bottom'))
+silence({dev.off()})
+pl = c(pl, list(NULL, leg, NULL))
+
+## Here's the real plot.
+plot_grid(plotlist = pl, nrow = 2, ncol = 3, rel_heights = c(0.8, 0.2))
+
+## Iterate adonis over visit number
+bray_adonis_list_2mo = visits[-1] %>%
+    lapply(
+function(v)
+{
+    thisvisitsams = metadata[visit == v 
+                             & enrollment_id %in% alphadivdmm[!is.na(X2mo), enrollment_id]
+                            , sample_name] %>%
+        intersect(colnames(goodcounts))
+    
+    thisvisitcounts = spp_counts[,thisvisitsams] %>% t()
+    
+    thisvisitmeta = setkey(alphadivdmm, enrollment_id)[metadata[thisvisitsams, enrollment_id],] %>%
+        setkey(sample_name)
+    
+    v_bray = vegdist(thisvisitcounts, method = 'bray')
+
+        
+    ## Call adonis2, sequential
+    ado = adonis2(v_bray ~ formula_bm + delivery + country + age + X2mo, data = thisvisitmeta
+                  , by = 'terms'
+                  , permutations = how(nperm = 999)
+                  , na.action = 'na.omit')
+    
+    
+        ## Draw PCoA
+    v_bray_pcoa_ord = pcoa(v_bray)
+
+    v_bray_pcoa_coords = v_bray_pcoa_ord$vectors
+    
+    v_bray_pcoa_data = thisvisitmeta %>% cbind(v_bray_pcoa_coords)
+    
+    ## Draw PCoA
+    ri = which(attributes(ado)$row.names == 'X2mo')
+    pval = ado$`Pr(>F)`[ri]
+    Fval = ado$`F`[ri]
+    p = (
+        ggplot(v_bray_pcoa_data) +
+            geom_point(aes(x = Axis.1, y = Axis.2, color = X2mo)
+                      , size = 2) +
+            stat_ellipse(aes(x = Axis.1, y = Axis.2, color = X2mo)) + 
+            annotate('text', label = paste0('Pr(>F) = ', pval , ifelse(pval < 0.05, '*','')
+                                            , '\n', 'F = ', round(Fval,1))
+                     , x = min(v_bray_pcoa_data$Axis.1) - 0.05
+                     , y = max(v_bray_pcoa_data$Axis.2) + 0.05
+                     , hjust = 0, vjust = 1) + 
+            theme_bw() +
+            theme(legend.position = 'none') +
+            ggtitle(paste0('Bray-Curtis, 2mo DMMs at ', v)) 
+    )
+    return(list(adonis = ado, plot = p))
+}) %>% setNames(visits[-1])
+
+bray_adonis_list_2mo %>% lapply(function(x) print(x$adonis))
+pl = bray_adonis_list_2mo %>% lapply(function(x) x$plot )
+
+## This generates a plot window -- prevent that by redirecting to null output.
+pdf(file = NULL)
+    leg = g_legend(bray_adonis_list_2mo[[1]]$plot + theme(legend.position = 'bottom'))
+silence({dev.off()})
+pl = c(pl, list(NULL, leg, NULL))
+
+## Here's the real plot.
+plot_grid(plotlist = pl, nrow = 2, ncol = 3, rel_heights = c(0.8, 0.2))
+```
+
+
+# Exit
+```{r Save}
+fwrite(cs_dmm_data[enrollment_id != '', .(enrollment_id, country, 'DMM_NB' = NB,  'DMM_2mo' = X2mo, 'DMM_4mo' = X4mo)], 'rota-cross-sectional-dmms.txt.xls', sep='\t')
+save(list = ls(all.names = TRUE), file = 'dmms.RData')
+sessionInfo()
+```

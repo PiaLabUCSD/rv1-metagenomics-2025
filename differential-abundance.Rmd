@@ -1,0 +1,322 @@
+---
+title: "ROTA Metagenomics: Differential abundance"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+    number_sections: true
+    theme: lumen
+---
+
+# Summary
+This document contains the scripts used to identify differentially abundant taxa on the Rota metagenome dataset.
+
+# Setup
+In this section are the chunks that set up the script for differential abundance analysis. Load in libraries, set parameters, and reformat the TSE object.
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width=10, fig.height=8)
+```
+
+```{r libraries}
+## override library function to silence all package messages.
+silence = function(x) suppressPackageStartupMessages(suppressWarnings({invisible({capture.output(x)})}))
+library = function(...) silence({base::library(...)})
+
+library('data.table')
+library('tidyverse')
+library('ggplot2')
+library('ANCOMBC')
+library('mia')
+library('MicrobiomeStat')
+library('Maaslin2') ## bioconductor
+library('dplyr')
+library('UpSetR')
+library('cowplot')
+library('phyloseq')
+        
+load(file="initialized-dataset.RData")
+set.seed(42)
+
+qval_threshold = 0.1 ## alter to make stricter/more lenient.
+
+```
+
+```{r DataManip}
+
+## Function to assign significance at 0.1/0.05 level.
+assign_stars = function(pvalues) ifelse(pvalues < 0.1, '.','n.s.') %>%
+                 ifelse(pvalues < 0.05, '*',.)
+
+## Taxa-are-rows
+subsetByAbundantFeatures = function(x, abundance)
+{
+    rowProps = x %>% assay() %>% apply(2, function(y) y/sum(y))
+    x[(rowSums(rowProps >= abundance) > 0) %>% which(),]
+}
+
+physeq_decon = merge_phyloseq(otudecon, taxdecon, sample_data(samdf))
+tse_decon = makeTreeSEFromPhyloseq(physeq_decon)
+tse_spp = agglomerateByRank(tse_decon, rank = 'Species')
+
+## Library size
+colData(tse_spp)$library_size = colSums(assay(tse_spp, "counts"))
+colData(tse_spp)$log_pre_rota_sero_iga = log(tse_spp$pre_rota_sero_iga)
+colData(tse_spp)$log_post_rota_sero_iga = log(tse_spp$post_rota_sero_iga)
+
+countries = metadata[,country] %>% unique() %>% na.omit()
+visits = metadata[,visit] %>% unique() %>% na.omit()
+# slice_grid = expand.grid(countries, visits) %>% na.omit()
+
+tse_sero = tse_spp[, !is.na(tse_decon$Seroconverted)] ## we have pre and post both
+
+tse_sero_subset = tse_sero %>%
+    subsetByAbundantFeatures(abundance = 0.01) %>%
+    subsetByPrevalentFeatures(prevalence = 0.05)
+
+```
+
+
+# Longitudinal Differential abundance
+Execute diffabund using MAASLin2
+```{r Maaslin2}
+
+## Define ref levels
+reference = c('country,Panama', 'formula_bm,BOTH', 'visit,NB')
+fixed_effects = c('visit', 'country', 'formula_bm', 'delivery', 'gest_age', 'library_size', 'Seroconverted')
+random_effects = 'enrollment_id'
+
+maaslin2_out = Maaslin2(input_data = tse_sero_subset %>% assay() %>% t() %>% as.data.frame(),
+             input_metadata = tse_sero_subset %>% colData() %>% as.data.frame(),
+             output = "results/Maaslin2",
+             transform = "AST",
+             fixed_effects = fixed_effects,
+             random_effects = random_effects,
+             reference = reference,
+             normalization = "TSS",
+             plot_heatmap = FALSE,
+             plot_scatter = FALSE,
+             save_scatter = FALSE,
+             save_models = FALSE,
+             standardize = FALSE)
+
+maaslin2_res = maaslin2_out$results %>%
+    filter(qval < qval_threshold) %>% print()
+
+```
+
+Execute diffabund using LinDA
+```{r LinDA}
+
+assign('linda_out',
+    linda(as.data.frame(assay(tse_sero_subset, "counts")),
+        as.data.frame(colData(tse_sero_subset)),
+        formula = "~ visit + country + formula_bm + delivery + gest_age + Seroconverted + library_size + (1 | enrollment_id)",
+        alpha = qval_threshold
+        )
+) %>% invisible() %>% capture.output()
+
+linda_res = linda_out$output$SeroconvertedResponder
+
+linda_res %>%
+  filter(reject) %>%
+  dplyr::select(log2FoldChange, stat, padj) %>%
+  rownames_to_column(var = "feature")  %>% print()
+
+```
+
+Execute diffabund using ANCOM-BC2
+```{r ANCOMBC2}
+## Function to execute ancombc2 repeatedly.
+execute_ancombc2 = function(x, tax_levels, fix_formula, rand_formula, group)
+{
+    tt = 'Species'
+    neg_lb = FALSE
+    ancombc2(data = x
+        , assay.type = "counts"
+        , fix_formula = fix_formula
+        , rand_formula = rand_formula
+        , p_adj_method = "fdr"
+        , group = group
+        , struc_zero = TRUE
+        , neg_lb = TRUE
+        , alpha = qval_threshold
+        , global = TRUE
+    )
+}
+
+## Exec ancombc2
+ancombc2_out = execute_ancombc2(
+      x = tse_sero_subset
+    , tax_levels = c('Species')
+    , fix_formula = "visit + country + formula_bm + delivery + gest_age + Seroconverted + library_size"
+    , rand_formula = "(1 | enrollment_id)"
+    , group = 'Seroconverted'
+)
+
+## Print results
+ancombc2_out$res %>%
+  dplyr::select(taxon, lfc_SeroconvertedResponder, q_SeroconvertedResponder) %>%
+  filter(q_SeroconvertedResponder < qval_threshold) %>%
+  arrange(q_SeroconvertedResponder) %>% print()
+
+```
+
+```{r Coallate}
+
+results = list()
+
+results[['global']] = list(
+    as.data.table(ancombc2_out$res)[,
+       .(Species = taxon %>% make.names()
+        , effectSize = lfc_SeroconvertedResponder / log(2)
+        , SE = se_SeroconvertedResponder / log(2)
+        , padj = q_SeroconvertedResponder
+        , pval = p_SeroconvertedResponder
+        , method = 'ANCOM-BC2'
+        , timepoint = 'global'
+        )]
+    ,
+    
+    as.data.table(linda_out$output$SeroconvertedResponder, keep.rownames = TRUE)[,
+        .(Species = rn %>% make.names()
+        , effectSize = log2FoldChange
+        , SE = lfcSE
+        , padj
+        , pval = pvalue
+        , method = 'LinDA'
+        , timepoint = 'global'
+        )]
+    ,
+    as.data.table(maaslin2_out$results)[metadata == 'Seroconverted',
+        .(Species = feature %>% make.names()
+        , effectSize = coef
+        , SE = stderr
+        , padj = qval
+        , pval
+        , method = 'Maaslin2'
+        , timepoint = 'global'
+        )]
+) %>% do.call('rbind', .)
+```
+
+```{r PlotDiffabunds, fig.height = 6, fig.width = 8}
+
+plottingdata = results[['global']]
+
+## Render volcano-ish plot.
+plottingdata[,signif := assign_stars(padj)]
+
+plottingdata[,errmin := effectSize - 2*SE]
+plottingdata[,errmax := effectSize + 2*SE]
+signif_spp = plottingdata[padj < qval_threshold, Species] %>% unique()
+
+errdata = plottingdata[Species %in% signif_spp,][,.(errcords = c(errmin,errmax)), by = .(Species, method)]
+
+p1 =  ggplot(data = plottingdata) +
+    geom_point(aes(x = effectSize, y = -log10(pval), color = signif)) +
+    facet_grid(~method, scales = 'free') +
+    scale_y_log10() +
+    theme_bw()
+
+p2 = ggplot(data = plottingdata[Species %in% signif_spp,]) +
+    geom_bar(aes(x = effectSize, y = Species, fill = signif), stat = 'identity') +
+    geom_line(data = errdata, aes(x=errcords, y = Species, group = Species)) +
+    facet_grid(~method, scales = 'free') +
+    theme_bw()
+
+
+plottingdt = plottingdata[padj < qval_threshold,] %>% dcast(Species ~ method, fun.aggregate = length)
+colnames(plottingdt) = colnames(plottingdt) %>% make.names()
+plottingmat = plottingdt[,-1] %>% as.matrix()
+
+
+intermediatelabels = c(2:(ncol(plottingmat)-1)) %>% lapply(function(m) combn(colnames(plottingmat), m, FUN = function(pp) paste0(pp, collapse='&'))) %>% unlist()
+intermediates = c(2:(ncol(plottingmat)-1)) %>% lapply(function(m) combn(1:ncol(plottingmat), m) %>% apply(2, function(ii) rowSums(plottingmat[,c(ii)]) - rowSums(matrix(plottingmat[,-ii], ncol = ncol(plottingmat) - m)) == m) %>% colSums()) %>% unlist()
+
+## Render upset plot
+upset(
+    fromExpression(
+        c(
+            plottingmat[rowSums(plottingmat) == 1,] %>% colSums(),
+            setNames(intermediates, intermediatelabels),
+            sum(rowSums(plottingmat) == ncol(plottingmat)) %>% setNames(paste0(colnames((plottingmat)), collapse='&'))
+        )
+    )
+)
+
+plot_grid(plotlist = list(p1, p2), nrow = 2)
+
+```
+
+# Cross-sectional differential abundance
+Execute diffabund using MAASLin2
+```{r Maaslin2_CS, fig.height = 4, fig.width = 3}
+
+## Define ref levels
+reference = c('country,Panama', 'formula_bm,BOTH')
+fixed_effects = c('age', 'country', 'formula_bm', 'delivery', 'gest_age', 'library_size', 'Seroconverted')
+
+for (visit in visits)
+{
+    tse_sero_subset_v = tse_sero[,colData(tse_sero)$visit == visit] %>%
+        subsetByAbundantFeatures(abundance = 0.01) %>%
+        subsetByPrevalentFeatures(prevalence = 0.05)
+    
+    assign(paste0('maaslin2_out_', visit)
+           , Maaslin2(input_data = tse_sero_subset_v %>% assay() %>% t() %>% as.data.frame(),
+                 input_metadata = tse_sero_subset_v %>% colData() %>% as.data.frame(),
+                 output = "results/Maaslin2" %>% paste0(.,'_',visit),
+                 transform = "AST",
+                 fixed_effects = fixed_effects,
+                 reference = reference,
+                 normalization = "TSS",
+                 standardize = FALSE,
+                 min_prevalence = 0,
+                 plot_heatmap = FALSE,
+                 plot_scatter = FALSE,
+                 save_scatter = FALSE,
+                 save_models = FALSE)
+    ) %>% invisible() %>% capture.output()
+}
+
+maaslin2_res_NB = maaslin2_out_NB$results %>%
+    filter(qval < qval_threshold) %>%
+    filter(metadata == 'Seroconverted') %>%
+    print()
+
+maaslin2_res_2mo = maaslin2_out_2mo$results %>%
+    filter(qval < qval_threshold) %>%
+    filter(metadata == 'Seroconverted') %>%
+    print()
+
+maaslin2_res_4mo = maaslin2_out_4mo$results %>%
+    filter(qval < qval_threshold) %>%
+    filter(metadata == 'Seroconverted') %>%
+    print()
+
+plottingdata = maaslin2_out_NB$results %>%  filter(metadata == 'Seroconverted') %>% as.data.table()
+plottingdata[,signif := assign_stars(qval)]
+
+p1 = ggplot(plottingdata) +
+    geom_point(aes(x = coef, y = -log10(pval), color = signif)) +
+    scale_y_log10() +
+    theme_bw()
+
+
+p2 = ggplot(data = plottingdata[signif != 'n.s.',]) +
+    geom_bar(aes(x = coef, y = feature, fill = signif), stat = 'identity') +
+    geom_segment(aes(x = coef - 2*stderr, xend = coef + 2*stderr,  y = feature, yend = feature, group = feature)) +
+    theme_bw()
+
+plot_grid(plotlist = list(p1, p2), nrow = 2)
+
+```
+
+# End
+```{r Save}
+save(list = ls(all.names = TRUE), file = 'diffabund.RData')
+sessionInfo()
+```

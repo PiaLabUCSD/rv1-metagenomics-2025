@@ -1,0 +1,387 @@
+---
+title: "ROTA Metagenomics: Alpha diversity"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+    number_sections: true
+    theme: lumen
+---
+
+# Summary
+This document contains the scripts used to calculate and analyze alpha diversity metrics on the Rota metagenome dataset.
+
+# Setup
+In this section are the chunks that call libraries into the environment and define some functions for plots that are used repeatedly. Just to make the code a little bit cleaner.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width=10, fig.height=8)
+```
+
+```{r libraries}
+## override library function to silence all package messages.
+silence = function(x) suppressPackageStartupMessages(suppressWarnings({invisible({capture.output(x)})}))
+library = function(...) silence({base::library(...)})
+library('data.table')
+library('tidyverse')
+
+load(file="initialized-dataset.RData")
+
+set.seed(42)
+```
+
+# Alpha Diversity.
+Here, wealculate alpha diversity metrics.
+```{r AlphaDiv}
+library('vegan')
+library('picante')
+library('VGAM')
+library('ggpubr')
+
+## Effective species richness
+emr = goodcounts %>%
+    abundance(0.0025) %>%
+    apply(2, function(x) sum(x > 0))
+
+## Transpose.
+ogurarecounts = rarecounts %>% t()
+
+## Run alpha diversity metrics
+metrics = c('shannon', 'simpson')
+divs = metrics %>% lapply(function(m) vegan::diversity(ogurarecounts, m)) %>% do.call('cbind', .) %>% as.data.table(keep.rownames=TRUE) %>% setNames(c('rn', metrics)) %>% setkey(rn)
+
+## Run faith's PD.
+pd = picante::pd(ogurarecounts, rwoltree) %>%
+    as.data.table(keep.rownames=TRUE) %>%
+    setkey(rn)
+
+## Bind dataframes.
+setkey(metadata, sample_name)
+alphadivs = merge(divs, pd) %>% setkey(rn)
+alphadivdata = metadata[alphadivs,]
+alphadivdata = alphadivdata[,EMR := emr[sample_name]]
+
+## Add some vars
+alphadivdata[,log_post_rota_sero_iga := log(post_rota_sero_iga)]
+alphadivdata[,log_pre_rota_sero_iga := log(pre_rota_sero_iga)]
+
+## Drop individuals missing a timepoint.
+alphadivdata = alphadivdata[sample_name %in% colnames(all_timepoint_rarecounts),]
+
+## Version of the dataset with selected columns and NAs dropped.
+alphadivnona = alphadivdata[, .(SR, EMR, PD, shannon, simpson
+                              , enrollment_id, country, visit
+                              , formula_bm, sex, age, feeding_milk, feeding_form
+                              , abx_status, gest_age, inf_birth_weight, delivery
+                              , Seroconverted, Secretor, rota_sero_iga_fc
+                              , log_pre_rota_sero_iga, log_post_rota_sero_iga)
+                            ] %>% na.omit()
+
+## After dropping NAs, drop individuals missing a timepoint one more time.
+alphadivnona = alphadivnona[enrollment_id %in%
+               alphadivnona[,length(visit) %>% unique()
+                            , by = enrollment_id][V1 > 2 ,enrollment_id],]
+
+```
+
+```{r PlottingFunctions}
+library('ggplot2')
+library('cowplot')
+
+## Jitterplot.
+ggplot_jitterplot = function(dataset, x, y, color, group, facet_formula)
+{
+    facet_formula = as.formula(facet_formula)
+    ggplot(dataset) +
+    geom_path(aes_string(x = x, y = y, color = color, group = group)
+            , height = 0, alpha = 0.3, size = 1) +
+    geom_jitter(aes_string(x = x, y = y, color = color)
+              , height = 0, alpha = 0.5, size = 2) +
+    facet_wrap(facet_formula) +
+    theme_bw()
+}
+
+## Boxplot.
+ggplot_boxplot = function(dataset, x, y, color, facet_formula)
+{
+    facet_formula = as.formula(facet_formula)
+    ggplot(dataset) +
+        geom_boxplot(aes_string(x = x, y = y, color = color)) +
+        facet_wrap(facet_formula) +
+        theme_bw()
+}
+
+## loess curves.
+ggplot_loess = function(dataset, x, y, color, facet_formula)
+{
+    facet_formula = as.formula(facet_formula)
+    ggplot(dataset) +
+        stat_smooth(aes_string(x = x, y = y, color = color)
+                  , method = 'loess', formula = 'y ~ x') +
+        geom_jitter(aes_string(x = x, y = y, color = color)
+                  , height = 0, alpha = 0.5, size = 2) +
+        facet_wrap(facet_formula) +
+        theme_bw()
+}
+
+all_plots = function(dataset, y)
+{
+    ggplot_jitterplot(dataset = dataset, x = 'age', y = y
+                      , color = 'country', group = 'enrollment_id'
+                      , facet_formula = country ~ delivery) %>% plot()
+
+    ggplot_boxplot(dataset = dataset, x = 'visit', y = y
+                       , color = 'country'
+                       , facet_formula = ~delivery) %>% plot()
+
+    ggplot_loess(dataset = dataset, x = 'age', y = y
+                 , color = 'country'
+                 , facet_formula = delivery ~ country) %>% plot()
+}
+        
+
+```
+
+Univariate correlations show that IgA foldchange is near-significant with respect to species richness, however we don't have the statistical power necessary for a significant result slicing the dataset up like this, and so we'll just move on.
+```{r Univariate}
+library('broom')
+
+metrics = c('log(SR)','log(PD)','shannon','logit(simpson)', 'log(EMR)')
+visits = metadata[,visit] %>% na.omit() %>% unique()
+
+## Correlate fc to NB + 2mo + 4mo
+rota_fc_univariate = lapply(visits,
+function(v)
+{
+    metrics %>%
+    lapply(function(metric)
+    {
+        cor.test(alphadivdata[visit == v, eval(parse(text=metric))]
+               , alphadivdata[visit == v, log(rota_sero_iga_fc)]
+               , method = 'spearman') %>%
+            broom::tidy() %>% 
+            cbind(metric, dv = 'IgA foldchange', .)
+    }) %>% do.call('rbind',.) %>% cbind(visit = v, .)
+}) %>% do.call('rbind',.)
+
+rota_fc_univariate$p.adj = p.adjust(rota_fc_univariate$p.value)
+
+## Correlate pre to the NB + 2mo
+rota_pre_univariate = lapply(visits[-3],
+function(v)
+{
+    metrics %>%
+    lapply(function(metric)
+    {
+        cor.test(alphadivdata[visit == v, eval(parse(text=metric))]
+               , alphadivdata[visit == v, log_pre_rota_sero_iga]
+               , method = 'spearman') %>%
+            broom::tidy() %>% 
+            cbind(metric, dv = 'Pre-vaccine IgA', .)
+    }) %>% do.call('rbind',.) %>% cbind(visit = v, .)
+}) %>% do.call('rbind',.)
+
+rota_pre_univariate$p.adj = p.adjust(rota_pre_univariate$p.value)
+
+rota_pre_univariate %>% arrange(p.adj)
+rota_fc_univariate %>% arrange(p.adj)
+```
+Here, we plot the generic alpha div metrics.
+```{r PlotAlphaDivs, fig.width=6, fig.height = 5}
+all_plots(alphadivnona, y = 'log(SR)')
+all_plots(alphadivnona, y = 'log(PD)')
+all_plots(alphadivnona, y = 'shannon')
+all_plots(alphadivnona, y = 'logit(simpson)')
+```
+
+# Linear mixed effect models
+In this section, we use a set of linear mixed models to determine the factors that significantly influence alpha diversity among the cohort. 
+
+First, we plot the response vars to make sure that they are roughly normally distributed. Simpson is not so, however applying a logit transform fixes the issue. We also seem to get some improvement by log-transforming OGU Richness and Faith's PD. Shannon is better (although not perfect) sans transformation.
+```{r ModelFuns}
+library('lme4')
+library('afex')
+library('car')
+library('performance')
+
+## Quick enclose function, puts a term in parens.
+enclose = function(x) paste0('(',x,')')
+
+fixedeff = c('formula_bm', 'visit', 'abx_status', 'country', 'sex'
+             , 'inf_birth_weight', 'gest_age', 'delivery'
+             , 'Seroconverted', 'Secretor')
+randeff = c('enrollment_id')
+
+norm_plot = function(x, transform = 'no', label)
+{
+    no = function(x) x
+    x_trans = get(transform)(x)
+    pd = data.table(x, x_trans)
+    list(
+        ggplot(pd, aes(x=x)) +
+            geom_density(alpha = 0.5, color = 'black', fill = 'gray') +
+            theme_bw() +
+            ggtitle(label)
+        
+      , ggplot(pd, aes(x=x_trans)) +
+            geom_density(alpha = 0.5, color = 'black', fill = 'gray') +
+            theme_bw() +
+            ggtitle(paste0(label, '(', transform, '-transform)'))
+      
+      , ggplot(pd,aes(sample=x)) +
+            stat_qq() +
+            stat_qq_line() +
+            theme_bw() +
+            ggtitle(paste0('QQ plot: ',label))
+        
+      , ggplot(pd,aes(sample=x_trans)) +
+            stat_qq() +
+            stat_qq_line() +
+            theme_bw() +
+            ggtitle(paste0('QQ plot: ',label, '(', transform, '-transform)'))
+    ) %>% plot_grid(plotlist = .)
+}
+
+lmm_modl = function(data, result_term, fixedeff, randeff, label)
+{
+    random_int = lapply(randeff, function(x) paste0('1 | ', x)) %>% lapply(enclose)
+    
+    fixed_effects_terms = paste0(fixedeff, collapse = ' + ')
+    
+    rand_int_terms = random_int %>% 
+                        unlist() %>% 
+                        unique() %>% 
+                        paste0(collapse = ' + ')
+    
+    effect_terms = paste0(fixed_effects_terms, ' + ', rand_int_terms)
+    
+    ## We're going to figure out what the best model for the random effect is first.
+    nullform = as.formula(paste0(result_term, ' ~ 1 + ', rand_int_terms))
+    nullmodl = lmer(nullform, data = data, REML = FALSE, na.action = 'na.fail')
+    icc(nullmodl)
+    
+    ## Build the full formula & model
+    fullform = as.formula(paste0(result_term, ' ~ 1 + ', effect_terms))
+    fullmodl = lmer(fullform, data = data, REML = FALSE, na.action = 'na.fail')
+    
+    ## Get vifs & new icc
+    vif(fullmodl)
+    icc(fullmodl)
+    
+    ## Make sure that our model is informative.
+    modlaov = anova(nullmodl, fullmodl, refit=TRUE)
+    print(modlaov)
+    
+    fit = data.table(predicted = predict(fullmodl), residual = residuals(fullmodl))
+    
+    list(
+        ggplot(fit,aes(x=residual)) +
+            geom_histogram() +
+            theme_bw() +
+            ggtitle(paste0("Residuals / OGU Richness", label))
+      , ggplot(fit,aes(x=residual, y = predicted)) +
+          geom_point() +
+          theme_bw() +
+          ggtitle(paste0("Residuals vs. predicted / ", label))
+      , ggplot(fit, aes(sample=residual)) +
+          stat_qq() +
+          stat_qq_line() +
+          theme_bw() +
+          ggtitle(paste0("Residual QQ-plot / ", label))
+    ) %>% plot_grid(plotlist = .)
+    
+    aovmixed = mixed(fullform
+                     , data=data
+                     , check_contrasts = TRUE
+                     , test_intercept = TRUE
+                     , method="KR")
+    print(aovmixed)
+    print(summary(fullmodl))
+    
+    signifdt = aovmixed$anova_table %>% as.data.table(keep.rownames=TRUE)
+    return(signifdt)
+}
+```
+
+Build linear model for species richness.
+```{r BuildModels}
+norm_plot(alphadivnona[,SR], transform = 'log', label = 'OGU Richness')  
+SR_signifdt = lmm_modl(alphadivnona, 'log(SR)', fixedeff, randeff, label = 'OGU Richness')
+
+norm_plot(alphadivnona[,EMR], transform = 'log', label = 'EM Richness')  
+EMR_signifdt = lmm_modl(alphadivnona, 'EMR', fixedeff, randeff, label = 'OGU Richness')
+
+norm_plot(alphadivnona[,PD], transform = 'log', label = "Faith's PD")  
+PD_signifdt = lmm_modl(alphadivnona, 'log(PD)', fixedeff, randeff, label = "Faith's PD")
+
+norm_plot(alphadivnona[,simpson], transform = 'logit', label = "Simpson")  
+simpson_signifdt = lmm_modl(alphadivnona, 'logit(simpson)', fixedeff, randeff, label = 'Simpson')
+
+norm_plot(alphadivnona[,shannon], transform = 'log', label = "Shannon")  
+shannon_signifdt = lmm_modl(alphadivnona, 'shannon', fixedeff, randeff, label = 'Shannon')
+```
+```{r FollowUp}
+fixedeff = c('formula_bm', 'visit', 'abx_status', 'country', 'sex'
+             , 'inf_birth_weight', 'gest_age', 'delivery'
+             , 'log_pre_rota_sero_iga', 'Secretor')
+randeff = c('enrollment_id')
+
+SR_pre_signifdt = lmm_modl(alphadivnona, 'log(SR)', fixedeff, randeff, label = 'OGU Richness')
+PD_pre_signifdt = lmm_modl(alphadivnona, 'log(PD)', fixedeff, randeff, label = 'Faith\'s PD')
+EMR_pre_signifdt = lmm_modl(alphadivnona, 'EMR', fixedeff, randeff, label = 'OGU EMR')
+simpson_pre_signifdt = lmm_modl(alphadivnona, 'logit(simpson)', fixedeff, randeff, label = 'Simpson')
+shannon_pre_signifdt = lmm_modl(alphadivnona, 'shannon', fixedeff, randeff, label = 'Shannon')
+
+fixedeff = c('formula_bm', 'visit', 'abx_status', 'country', 'sex'
+             , 'inf_birth_weight', 'gest_age', 'delivery'
+             , 'log(rota_sero_iga_fc)', 'Secretor')
+randeff = c('enrollment_id')
+
+```
+
+```{r PlotSignifs}
+
+signifdt = list(
+      SR_signifdt[,.(variable = rn, Fval = `F`, pval = `Pr(>F)`, metric = 'Richness')]
+    , EMR_signifdt[,.(variable = rn, Fval = `F`, pval = `Pr(>F)`, metric = 'EMR')]
+    , PD_signifdt[,.(variable = rn, Fval = `F`, pval = `Pr(>F)`, metric = 'PD')]
+    , shannon_signifdt[,.(variable = rn, Fval = `F`, pval = `Pr(>F)`, metric = 'shannon')]
+    , simpson_signifdt[,.(variable = rn, Fval = `F`, pval = `Pr(>F)`, metric = 'simpson')]
+) %>% do.call('rbind', .)
+
+signifdt = signifdt[variable != '(Intercept)',]
+signifdt[, significant := pval < 0.05]
+
+ggplot(signifdt, aes(x = metric, y = variable)) +
+    geom_tile(data = signifdt[is.na(significant),]
+            , color = 'gray', size = 1, fill = 'gray') +
+    geom_tile(data = signifdt[pval >= 0.1 ,]
+            , color = 'gray', size = 1, fill = NA) +
+    geom_tile(data = signifdt[pval < 0.1,]
+            , color = 'darkgray', size = 2, fill = NA) +
+    geom_tile(data = signifdt[pval < 0.05,]
+            , color = 'black', size = 2, fill = NA) +
+    geom_point(data = signifdt[!is.na(significant),]
+             , aes(size = Fval, fill = Fval)
+             , shape = 21) +
+    scale_x_discrete(expand = c(0,0)) +
+    scale_y_discrete(expand = c(0,0)) +
+    scale_size_continuous(range = c(0,15), limits = c(0, 20), breaks = c(0:4)*5) +
+    coord_equal(ratio = 1) +
+    theme_pubclean() +
+    theme(
+        axis.title.x = element_blank()
+      , axis.title.y = element_blank()
+    ) +
+    ggtitle('LMM with KR test: Alpha diversity')
+
+```
+
+# Exit
+```{r Save}
+save(list = ls(all.names = TRUE), file = 'alpha-div.RData')
+sessionInfo()
+```

@@ -1,0 +1,601 @@
+---
+title: "ROTA Metagenomics: Beta diversity"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+    number_sections: true
+    theme: lumen
+---
+# Summary
+This document contains the scripts used to calculate beta diversity and perform statistical analysis on the Rota Metagenomes.
+
+# Setup
+In this section are the chunks that call libraries into the environment and intitalize the dataset.
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width=10, fig.height=8)
+```
+
+```{r libraries}
+## override library function to silence all package messages.
+silence = function(x) suppressPackageStartupMessages(suppressWarnings({invisible({capture.output(x)})}))
+library = function(...) silence({base::library(...)})
+
+library('data.table')
+library('tidyverse')
+library('vegan')
+library('compositions')
+library('uwot')
+library('rbiom')
+library('ggforce')
+library('ggpubr')
+library('glmnet')
+library('ape')
+library('gllvm')
+
+reset = TRUE
+load(file="alpha-div.RData")
+
+set.seed(42)
+```
+
+In this section, we calculate and plot beta diversity metrics.
+
+# Distances
+Calculate distance metrics using the transformed values.
+```{r Distances}
+## Unifrac
+wunifrac = rbiom::unifrac(rarecounts, tree = rwoltree)
+uwunifrac = rbiom::unifrac(rarecounts, weighted = FALSE, tree = rwoltree)
+
+## Bray curtis & jaccard
+bray = vegdist(rarecounts %>% t(), method = 'bray')
+jacc = vegdist(rarecounts %>% t(), method = 'jacc')
+
+## clr-transformed euclids on spp.
+aitchison = vegdist(spp_clr, method = 'euclidean')
+
+```
+
+# Ordinations
+```{r}
+plot_ordination = function(pcoa_ord)
+{
+    pcoa_coords = pcoa_ord$vectors %>%
+        as.data.table(keep.rownames = TRUE) %>%
+        setkey(rn)
+    pcoa_data = metadata[pcoa_coords,][!is.na(Seroconverted),]
+
+    ## All samples
+    (
+    ggplot(pcoa_data) +
+        geom_point(aes(x = Axis.1, y = Axis.2, fill = Seroconverted), shape=21) +
+        stat_ellipse(aes(x = Axis.1, y = Axis.2, color = Seroconverted
+                       , group = interaction(Seroconverted))
+                     , size = 1) +
+        theme_bw()
+    ) %>% plot()
+    
+    ## Div by visit.
+    (
+    ggplot(pcoa_data) +
+        geom_point(aes(x = Axis.1, y = Axis.2, fill = Seroconverted), shape=21) +
+        stat_ellipse(aes(x = Axis.1, y = Axis.2, color = Seroconverted
+                       , group = interaction(visit, Seroconverted))
+                     , size = 1) +
+        facet_grid(~visit) +
+        theme_bw()
+    ) %>% plot()
+        
+    ## Div by country + visit
+    (
+    ggplot(pcoa_data) +
+        geom_point(aes(x = Axis.1, y = Axis.2, fill = Seroconverted), shape=21) +
+        stat_ellipse(aes(x = Axis.1, y = Axis.2, color = Seroconverted
+                       , group = interaction(visit, Seroconverted, country))
+                     , size = 1) +
+        facet_grid(country~visit) +
+        theme_bw()
+    ) %>% plot()
+}
+```
+
+## Unweighted-Unifrac
+```{r UUnifracPCOA, fig.width=8, fig.height =5}
+uu_pcoa_ord = pcoa(uwunifrac)
+plot_ordination(uu_pcoa_ord)
+```
+
+## Weighted-Unifrac
+Plot Weighted Unifrac ordinations
+```{r WUnifracPCOA, fig.width=8, fig.height =5}
+wu_pcoa_ord = pcoa(wunifrac)
+plot_ordination(wu_pcoa_ord)
+
+```
+
+## Bray-Curtis
+Plot Bray-Curtis ordinations
+```{r BrayPCOA,fig.width=8, fig.height =5}
+bc_pcoa_ord = pcoa(bray)
+plot_ordination(bc_pcoa_ord)
+
+```
+
+## Aitchison
+Aitchison PCoA
+```{r AitchisonPCoA, fig.width=8, fig.height=5}
+at_pcoa_ord = pcoa(aitchison)
+plot_ordination(at_pcoa_ord)
+```
+
+# PERMANOVA
+To test whether microbiome structure has an impact on ORV seroconversion, we perform a series of beta diversity analyses using adonis2 on each of the distance matrices.
+
+First, set up our dataset.
+```{r SetupAdonis2}
+library('cowplot')
+library('vegan')
+library('ggplotify')
+library('ggpubr')
+
+bubbleplot = function(adolist)
+{
+    timepoints = md[,visit] %>% unique()
+    timepointdt = timepoints %>% lapply(
+    function(x) 
+    {
+        z = adolist[[x]][[1]] %>% as.data.table(keep.rownames = TRUE)
+        z[, timepoint := x]
+    }
+    ) %>% do.call('rbind', .)
+
+    
+    timepointdt = timepointdt[! (rn %in% c('Residual', 'Total')), ]
+    colnames(timepointdt) = make.names(colnames(timepointdt))
+    
+    ## Convert infinite F-values to zero
+    timepointdt[is.na(Pr..F.), F := 0]
+    
+    ## Pvalue of 1.
+    #timepointdt[is.na(Pr..F.), Pr..F. := 1]
+    
+    ## Get negative log pval.
+    timepointdt[,neglogpval := -log10(Pr..F.)]
+    
+    ## Remove entries with zero log-pvalue.
+    #timepointdt = timepointdt[neglogpval > 0,]
+    
+    ## Significant entries are those with pvalue < 0.05
+    timepointdt[, significant := Pr..F. < 0.05]
+
+    ggplot(timepointdt, aes(x = timepoint, y = rn)) +
+        geom_tile(data = timepointdt[is.na(significant),]
+                , color = 'gray', size = 1, fill = 'gray') +
+        geom_tile(data = timepointdt[Pr..F. >= 0.1 ,]
+                , color = 'gray', size = 1, fill = NA) +
+        geom_tile(data = timepointdt[Pr..F. < 0.1,]
+                , color = 'darkgray', size = 2, fill = NA) +
+        geom_tile(data = timepointdt[Pr..F. < 0.05,]
+                , color = 'black', size = 2, fill = NA) +
+        geom_point(data = timepointdt[!is.na(significant),]
+                 , aes(size = R2, fill = R2)
+                 , shape = 21) +
+        scale_x_discrete(expand = c(0,0)) +
+        scale_y_discrete(expand = c(0,0)) +
+        scale_size_continuous(range = c(0,50), limits = c(0, 1), breaks = c(1:4)/100) +
+        coord_equal(ratio = 1) +
+        theme_pubclean() +
+        theme(
+            axis.title.x = element_blank()
+          , axis.title.y = element_blank()
+        )
+}
+
+## Select vars.
+vars = c('age', 'delivery', 'formula_bm', 'Secretor', 'solid_food_introduced', 'inf_birth_weight', 'gest_age', 'country', 'sex', 'Seroconverted')
+
+## fix these so that they are invariant; we have no real datapoints where solid food was introduced
+## before 4mo, and so this variable is excluded from analysis for NB + 2mo timepoints.
+metadata[visit == 'NB' & is.na(solid_food_introduced), solid_food_introduced := 0]
+metadata[visit == '2mo' & is.na(solid_food_introduced), solid_food_introduced := 0]
+
+square_metadata = metadata[colnames(goodcounts), mget(c('pre_rota_sero_iga', 'post_rota_sero_iga', 'sample_name', 'enrollment_id', 'visit', vars))] %>% na.omit()
+
+md = square_metadata[enrollment_id %in% ((table(enrollment_id) > 0) %>% which() %>% names()),] %>% setkey(sample_name)
+
+nperm = 9999
+```
+
+## Within-block restricted PERMANOVA
+Restricting permutations within enrollment ids and using a marginal test allows us to explore whether we can expect a significant difference at the very top level. Here, we ask: are there differences at any timepoint that correlate to seroconversion?
+
+For the block-restricted PERMANOVA, we use only data from individuals who have samples from all three timepoints.
+```{r RestrictedPERMANOVA}
+
+## We're going to split on timepoint -- and so first we will check to make sure
+## that visit makes a difference in community structure.
+
+## Grab all samples.
+rdamd = square_metadata[enrollment_id %in% ((table(enrollment_id) == 3) %>% which() %>% names()),][order(visit),]
+
+rdasamples = rdamd[, sample_name]
+
+## Run 
+rdacounts = rarecounts[,rdasamples] %>%
+    agglomerate(taxonomy, 's') %>%
+    t()
+
+rda_bray = vegdist(rdacounts, method = 'bray')
+rda_aitch = vegdist(spp_clr[rownames(rdacounts),]
+                    , method = 'euclidean')
+
+## Permutation structure for time-series within-block permutations.
+perms = how(
+  , blocks = rdamd[, enrollment_id]
+  , within = Within(type = 'series')
+  , nperm = nperm
+)
+
+## Restricted-permutation models.
+## Run adonis2 with restricted perm model on bray-curtis
+adonis2(rda_bray ~ delivery + formula_bm + visit + age + country + Seroconverted
+        , data = rdamd, by ='margin', permutations = perms, na.action = 'na.omit')
+
+## Run on Aitchison
+adonis2(rda_aitch ~ delivery + formula_bm + visit + age + country + Seroconverted
+        , data = rdamd, by ='margin', permutations = perms, na.action = 'na.omit')
+```
+Science is how we prove that the obvious is actually true. Visit is indeed significant.
+
+We find that Aitchison is statistically significant for Seroconversion, but Bray-Curtis is not. So, what this test tells us is that there is an interaction between seroconversion and some of the vars in the list, and that this is represented by differences in the relative abundance of some taxa, but likely not the dominant ones in the overall system.
+
+## Cross-sectional PERMANOVA
+Here, we test each timepoint cross-sectionally to discover the relevant timepoint(s) for seroconversion. To do this, we perform a cross-sectional PERMANOVA, this time using all datapoints from each cross-section.
+```{r WUnifrac_SplitOnTime, fig.width = 6, fig.height = 3}
+
+## Build formula from vars
+formula = paste0('v_wunifrac ~ ', paste0(vars, collapse = ' + '))
+
+## Iterate adonis over visit number
+wu_adonis_list = md[,visit] %>% unique() %>% lapply(
+function(v)
+{
+    ## Generate new unweighted unifrac matrix representing the visit subset.
+    silence({v_wunifrac = rbiom::unifrac(rarecounts[,md[visit == v, sample_name]], weighted = TRUE, tree = rwoltree)})
+    
+    ## Call adonis2, marginal.
+    ado = adonis2(as.formula(formula), data = md[visit == v,], by ='margin', permutations = how(nperm = nperm))
+    
+    ## Draw PCoA
+    v_wunifrac_pcoa_ord = pcoa(v_wunifrac)
+    pcoa_coords = v_wunifrac_pcoa_ord$vectors %>%
+        as.data.table(keep.rownames = TRUE) %>%
+        setkey(rn)
+    pcoa_data = metadata[pcoa_coords,][!is.na(Seroconverted),]
+    pl = (
+    ggplot(pcoa_data) +
+        geom_point(aes(x = Axis.1, y = Axis.2, fill = Seroconverted), shape=21) +
+        stat_ellipse(aes(x = Axis.1, y = Axis.2, color = Seroconverted
+                       , group = interaction(Seroconverted))
+                     , size = 1) +
+        theme_bw() +
+        ggtitle(v)
+    )
+    
+    list(ado, pl, v_wunifrac)
+}) %>% setNames(md[,visit] %>% unique())
+
+wu_adonis_list[[1]] %>% print()
+pl = lapply(wu_adonis_list, function(x) ((x[[2]]) + theme(legend.position = 'none')))
+ple = ggpubr::get_legend(wu_adonis_list[[1]][[2]] + theme(legend.position = 'bottom'))
+plot_grid(plotlist=c(pl, list(NULL), list(ggplotify::as.ggplot(ple)), list(NULL)), nrow = 2, ncol = 3, rel_heights = c(5,1))
+
+```
+
+Weighted UniFrac is near-significant at NB.
+
+```{r PlotWUnifracSplitsOnTime, fig.width = 6, fig.height = 6}
+bubbleplot(wu_adonis_list) + ggtitle('adonis2: Weighted unifrac')
+
+v = 'NB'
+## Generate new unweighted unifrac matrix representing the visit subset.
+v_wunifrac = rbiom::unifrac(rarecounts[,md[visit == v, sample_name]], weighted = TRUE, tree = rwoltree)
+adonis2(v_wunifrac ~ formula_bm + delivery + age + country + Seroconverted, data = md[visit == v,], by ='terms', permutations = how(nperm = nperm))
+adonis2(v_wunifrac ~ formula_bm + delivery + age + country + log(pre_rota_sero_iga) + log(post_rota_sero_iga), data = md[visit == v,], by ='terms', permutations = how(nperm = nperm))
+
+v = '2mo'
+v_wunifrac = rbiom::unifrac(rarecounts[,md[visit == v, sample_name]], weighted = TRUE, tree = rwoltree)
+adonis2(v_wunifrac ~ formula_bm + delivery + age + country + Seroconverted, data = md[visit == v,], by ='terms', permutations = how(nperm = nperm))
+adonis2(v_wunifrac ~ formula_bm + delivery + age + country + log(pre_rota_sero_iga) + log(post_rota_sero_iga), data = md[visit == v,], by ='terms', permutations = how(nperm = nperm))
+```
+
+```{r UUnifrac_SplitOnTime, fig.width = 6, fig.height = 3}
+## Build formula from vars
+formula = paste0('v_uwunifrac ~ ', paste0(vars, collapse = ' + '))
+
+## Iterate adonis over visit number
+uwu_adonis_list = md[,visit] %>% unique() %>% lapply(
+function(v)
+{
+    ## Generate new unweighted unifrac matrix representing the visit subset.
+    v_uwunifrac = rbiom::unifrac(rarecounts[,md[visit == v, sample_name]], weighted = FALSE, tree = rwoltree)
+    
+    ## Call adonis2, marginal.
+    ado = adonis2(as.formula(formula), data = md[visit == v,], by ='margin', permutations = how(nperm = nperm))
+    
+    ## Draw PCoA
+    v_uwunifrac_pcoa_ord = pcoa(v_uwunifrac)
+
+    pcoa_coords = v_uwunifrac_pcoa_ord$vectors %>%
+        as.data.table(keep.rownames = TRUE) %>%
+        setkey(rn)
+    pcoa_data = metadata[pcoa_coords,][!is.na(Seroconverted),]
+    pl = (
+    ggplot(pcoa_data) +
+        geom_point(aes(x = Axis.1, y = Axis.2, fill = Seroconverted), shape=21) +
+        stat_ellipse(aes(x = Axis.1, y = Axis.2, color = Seroconverted
+                       , group = interaction(Seroconverted))
+                     , size = 1) +
+        theme_bw() +
+        ggtitle(v)
+    )
+    
+    list(ado, pl, v_uwunifrac)
+}) %>% setNames(md[,visit] %>% unique())
+
+uwu_adonis_list[[1]] %>% print()
+pl = lapply(uwu_adonis_list, function(x) ((x[[2]]) + theme(legend.position = 'none')))
+ple = ggpubr::get_legend(uwu_adonis_list[[1]][[2]] + theme(legend.position = 'bottom'))
+plot_grid(plotlist=c(pl, list(NULL), list(ggplotify::as.ggplot(ple)), list(NULL)), nrow = 2, ncol = 3, rel_heights = c(5,1))
+```
+
+Unweighted UniFrac is not significant at any timepoint.
+
+```{r PlotUUnifracSplitsOnTime, fig.width = 6, fig.height = 6}
+bubbleplot(uwu_adonis_list) + ggtitle('adonis2: Unweighted unifrac')
+
+v = 'NB'
+## Generate new unweighted unifrac matrix representing the visit subset.
+v_uwunifrac = rbiom::unifrac(rarecounts[,md[visit == v, sample_name]], weighted = FALSE, tree = rwoltree)
+adonis2(v_uwunifrac ~ formula_bm + delivery + age + country + Seroconverted, data = md[visit == v,], by ='terms', permutations = how(nperm = nperm))
+adonis2(v_uwunifrac ~ formula_bm + delivery + age + country + log(pre_rota_sero_iga) + log(post_rota_sero_iga), data = md[visit == v,], by ='terms', permutations = how(nperm = nperm))
+
+v = '2mo'
+## Generate new unweighted unifrac matrix representing the visit subset.
+v_uwunifrac = rbiom::unifrac(rarecounts[,md[visit == v, sample_name]], weighted = FALSE, tree = rwoltree)
+adonis2(v_uwunifrac ~ formula_bm + delivery + age + country + Seroconverted, data = md[visit == v,], by ='terms', permutations = how(nperm = nperm))
+adonis2(v_uwunifrac ~ formula_bm + delivery + age + country + log(pre_rota_sero_iga) + log(post_rota_sero_iga), data = md[visit == v,], by ='terms', permutations = how(nperm = nperm))
+```
+
+### Aitchison
+Run Aitchison cross-sectionally. Aitchison is statistically significant at the NB timepoint. We extend this to an additional sequential test for post-vaccine IgA.
+```{r Aitchison_SplitOnTime, fig.width = 6, fig.height = 3}
+
+formula = paste0('v_euclidean ~ ', paste0(vars, collapse = ' + '))
+
+timepoints = md[,visit] %>% unique()
+eu_adonis_list = timepoints %>% lapply(
+function(v)
+{
+    
+    ## Re-run CLR transform for each subset.
+    v_samples = md[visit == v, sample_name]
+    v_counts = spp_clr[v_samples,]
+    v_euclidean = vegdist(v_counts, method = 'euclidean')
+    ado = adonis2(as.formula(formula), data = md[visit == v,], by ='margin', permutations = how(nperm = nperm))
+    
+    v_euclidean_pcoa_ord = pcoa(v_euclidean)
+    pcoa_coords = v_euclidean_pcoa_ord$vectors %>%
+        as.data.table(keep.rownames = TRUE) %>%
+        setkey(rn)
+    pcoa_data = metadata[pcoa_coords,][!is.na(Seroconverted),]
+    pl = (
+    ggplot(pcoa_data) +
+        geom_point(aes(x = Axis.1, y = Axis.2, fill = Seroconverted), shape=21) +
+        stat_ellipse(aes(x = Axis.1, y = Axis.2, color = Seroconverted
+                       , group = interaction(Seroconverted))
+                     , size = 1) +
+        theme_bw() +
+        ggtitle(v)
+    )
+    
+    list(ado, pl, v_euclidean)
+}) %>% setNames(md[,visit] %>% unique())
+
+eu_adonis_list %>% lapply(function(x) x[[1]]) %>% print()
+pl = lapply(eu_adonis_list, function(x) ((x[[2]]) + theme(legend.position = 'none')))
+
+pdf(file = NULL)
+    ple = ggpubr::get_legend(eu_adonis_list[[1]][[2]] + theme(legend.position = 'bottom'))
+dev.off()
+
+plot_grid(plotlist=c(pl, list(NULL), list(ggplotify::as.ggplot(ple)), list(NULL)), nrow = 2, ncol = 3, rel_heights = c(5,1))
+```
+Aitchison is statistically significant at NB. We follow this up with an analysis of IgA response quantities pre- vs post- vaccine. We use a sequential PERMANOVA model, including terms discovered to be statistically significant based on the marginal PERMANOVA. At the end of the model, we include (in order) pre-vaccine IgA and then post-vaccine IgA. The purpose of putting these at the end is that the sequential model takes the terms in order from first-to-last, and so we can test whether there are differences in post-vaccine IgA after considering demographic variation and crucially, after considering differences in pre-existing immunity.
+
+```{r PlotEuclideanSplitsOnTime, fig.width = 6, fig.height = 6}
+bubbleplot(eu_adonis_list) + ggtitle('adonis2: Aitchison species counts')
+
+## For t1, Run an additional sequential PERMANOVA.
+v = 'NB'
+v_samples = md[visit == v, sample_name]
+v_counts = spp_clr[v_samples,]
+v_euclidean = vegdist(v_counts, method = 'euclidean')
+adonis2(v_euclidean ~ formula_bm + delivery + age + country + Seroconverted, data = md[visit == v,], by ='terms', permutations = how(nperm = nperm))
+
+adonis2(v_euclidean ~ formula_bm + delivery + age + country + log(pre_rota_sero_iga) + log(post_rota_sero_iga), data = md[visit == v,], by ='terms', permutations = how(nperm = nperm))
+
+v = '2mo'
+v_samples = md[visit == v, sample_name]
+v_counts = spp_clr[v_samples,]
+v_euclidean = vegdist(v_counts, method = 'euclidean')
+adonis2(v_euclidean ~ formula_bm + delivery + age + country + Seroconverted, data = md[visit == v,], by ='terms', permutations = how(nperm = nperm))
+adonis2(v_euclidean ~ formula_bm + delivery + age + country + log(pre_rota_sero_iga) + log(post_rota_sero_iga), data = md[visit == v,], by ='terms', permutations = how(nperm = nperm))
+
+```
+We find that, according to Aitchison distance there are significant differences in community structure correlated to post-vaccine IgA at the NB timepoint. This is not recapitulated for the 2mo timepoint. Hence, the differences in Seroconversion status observed at NB are driven by differences
+
+### Bray
+Run Bray, same thing. Here, we find that bray is near-signficant at the NB timepoint.
+```{r Bray_SplitOnTime, fig.width = 6, fig.height = 3}
+formula = paste0('v_bray ~ ', paste0(vars, collapse = ' + '))
+
+timepoints = md[,visit] %>% unique()
+br_adonis_list = timepoints %>% lapply(
+function(v)
+{
+    
+    ## Run bray on each subset.
+    v_samples = md[visit == v, sample_name]
+    v_goodcounts = rarecounts[,v_samples] %>%
+        agglomerate(taxonomy, 's')
+    
+    v_counts = v_goodcounts %>% t()
+
+    v_bray = vegdist(v_counts, method = 'bray')
+    ado = adonis2(as.formula(formula), data = md[visit == v,], by ='margin', permutations = how(nperm = nperm))
+    
+    v_bray_pcoa_ord = pcoa(v_bray)
+    pcoa_coords = v_bray_pcoa_ord$vectors %>%
+        as.data.table(keep.rownames = TRUE) %>%
+        setkey(rn)
+    pcoa_data = metadata[pcoa_coords,][!is.na(Seroconverted),]
+    pl = (
+    ggplot(pcoa_data) +
+        geom_point(aes(x = Axis.1, y = Axis.2, fill = Seroconverted), shape=21) +
+        stat_ellipse(aes(x = Axis.1, y = Axis.2, color = Seroconverted
+                       , group = interaction(Seroconverted))
+                     , size = 1) +
+        theme_bw() +
+        ggtitle(v)
+    )
+    
+    list(ado, pl, v_bray)
+    
+}) %>% setNames(md[,visit] %>% unique())
+
+br_adonis_list %>% lapply(function(x) x[[1]]) %>% print()
+pl = lapply(br_adonis_list, function(x) ((x[[2]]) + theme(legend.position = 'none')))
+pdf(file = NULL)
+    ple = ggpubr::get_legend(br_adonis_list[[1]][[2]] + theme(legend.position = 'bottom'))
+dev.off()
+plot_grid(plotlist=c(pl, list(NULL), list(ggplotify::as.ggplot(ple)), list(NULL)), nrow = 2, ncol = 3, rel_heights = c(5,1))
+```
+
+```{r PlotBraySplitsOnTime, fig.width = 6, fig.height = 6}
+bubbleplot(br_adonis_list) + ggtitle('adonis2: Bray Species counts')
+v = 'NB'
+v_samples = md[visit == v, sample_name]
+v_goodcounts = rarecounts[,v_samples] %>%
+    agglomerate(taxonomy, 's')
+
+v_counts = v_goodcounts %>% t()
+
+v_bray = vegdist(v_counts, method = 'bray')
+adonis2(v_bray ~ formula_bm + delivery + age + country + Seroconverted, data = md[visit == v,], by ='terms', permutations = how(nperm = nperm))
+adonis2(v_bray ~ formula_bm + delivery + age + country + log(pre_rota_sero_iga) + log(post_rota_sero_iga), data = md[visit == v,], by ='terms', permutations = how(nperm = nperm))
+
+## Run 2mo as well.
+v = '2mo'
+v_samples = md[visit == v, sample_name]
+v_goodcounts = rarecounts[,v_samples] %>%
+    agglomerate(taxonomy, 's')
+
+v_counts = v_goodcounts %>% t()
+
+v_bray = vegdist(v_counts, method = 'bray')
+adonis2(v_bray ~ formula_bm + delivery + age + country + Seroconverted, data = md[visit == v,], by ='terms', permutations = how(nperm = nperm))
+adonis2(v_bray ~ formula_bm + delivery + age + country + log(pre_rota_sero_iga) + log(post_rota_sero_iga), data = md[visit == v,], by ='terms', permutations = how(nperm = nperm))
+```
+
+
+## dbRDA
+The goal here is to figure out if the alr transform works and if it returns sensible results. I'm running this after having learned that Klebs are linked to nonresponse, and so we expect Klebs to top the list of contributor taxa. The goal here is to lay the groundwork for a good ML model down the road: if we can control for country + delivery + feeding + pre-vaccine IgA, then can we exploit this for a dimension reduction that will allow for prediction of vaccine response by partialling out variation?
+```{r dbRDA}
+library('easyCODA')
+## Get species scores using the feature table.
+# https://github.com/vegandevs/vegan/pull/256/commits/d3ea03370cbaa240f370b3addd6d648b16224566
+sppscores.dbrda = function(object, comm) 
+{
+    comm <- scale(comm, center = TRUE, scale = FALSE)
+    object$colsum <- apply(comm, 2, sd)
+    if (!is.null(object$pCCA) && object$pCCA$rank > 0) {
+        comm <- qr.resid(object$pCCA$QR, comm)
+    }
+    if (!is.null(object$CCA) && object$CCA$rank > 0) {
+        v <- crossprod(comm, object$CCA$u)
+        v <- decostand(v, "normalize", MARGIN = 2)
+        object$CCA$v <- v
+        comm <- qr.resid(object$CCA$QR, comm)
+    }
+    if (!is.null(object$CA) && object$CA$rank > 0) {
+        v <- crossprod(comm, object$CA$u)
+        v <- decostand(v, "normalize", MARGIN = 2)
+        object$CA$v <- v
+    }
+    object
+}
+
+## Axis contributions from a dbRDA object.
+get_axis_contribs_labs = function(crda)
+{
+    set = summary(crda)
+    coords = set$sites
+    contributions = set$cont$importance[2,]
+    axislabs = round(contributions * 100, 1) %>% paste0(names(contributions), '(', ., '%)') %>% setNames(names(contributions))
+    return(axislabs)
+}
+
+assign_stars = function(pvalues) ifelse(pvalues < 0.1, '.','n.s.') %>%
+                 ifelse(pvalues < 0.05, '*',.)
+
+## Params
+v = 'NB'
+perms = how(nperm = 9999)
+v_samples = md[visit == v, sample_name]
+
+## Build a comparable genus-level matrix
+gen_alr = ALR(t(gen_counts[,v_samples]) + 1
+            , denom = FINDALR(t(gen_counts[,v_samples]) + 1)$procrust.ref)$LR
+
+## dbRDA on Aitchison, conditioning out variation
+dbrda_alr = dbrda(gen_alr ~ Condition(delivery + formula_bm + country) + Seroconverted, data = md[visit == v,], by ='margin', permutations = perms, na.action = 'na.omit')
+anova(dbrda_alr, by = 'terms')
+
+## Calc genus scores using the community matrix
+dbrda_alr = sppscores.dbrda(dbrda_alr, comm = gen_alr[v_samples,])
+
+## Envfit for significance vs the axis of variation.
+ef = envfit(dbrda_alr, gen_alr[v_samples,])$vectors
+efdt = cbind(data.table(sp = ef[['r']] %>% names()
+           , r2 = ef[['r']] %>% as.numeric()
+           , pvalue = ef[['pvals']]%>% as.numeric()
+           ), ef[['arrows']]
+       ) %>% 
+    setNames(c('sp'
+              ,'r2'
+              ,'pvalue'
+              , colnames(ef[['arrows']])))
+efdt[,p.adj := p.adjust(pvalue, method = 'BH')]
+efdt[,signif := assign_stars(pvalue)]
+efdt[,p.adj := p.adjust(pvalue, method = 'BH')]
+efdt[,signif := assign_stars(pvalue)]
+setkey(efdt, sp)
+
+sppscores = data.table(spp = names(dbrda_alr$CCA$v[,1])
+                     , score = dbrda_alr$CCA$v[,1])[rev(order(abs(score))),]
+sppscores[,percent := score^2]
+
+sppscores[rev(order(percent)),][1:10,]
+
+```
+
+# End
+```{r Save}
+save(list = ls(all.names = TRUE), file = 'beta-div.RData')
+sessionInfo()
+```

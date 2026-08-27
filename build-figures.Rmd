@@ -1,0 +1,4250 @@
+---
+title: "ROTA Metagenomics: Build figures"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+    number_sections: true
+    theme: lumen
+---
+# Summary
+This document contains the scripts used to build nice-looking figures and tables for the paper. For the code used to analyze the data, please refer to the markdown files mentioned in each section.
+
+# Setup
+In this section are the chunks that call libraries into the environment.
+```{r}
+## override library function to silence all package messages.
+silence = function(x) suppressPackageStartupMessages(suppressWarnings({invisible({capture.output(x)})}))
+library = function(...) silence({base::library(...)})
+
+library('data.table')
+library('magrittr')
+library('svglite')
+library('DescTools')
+
+## load in theme elements.
+source('scripts/load-palettes.R')
+
+if (!dir.exists('figures')) dir.create('figures');
+
+## Labels for axis reassignments.
+relabely = setNames(c('M1','M2','M4') %>% factor(levels = c('M1','M2','M4'))
+                  , c('NB','2mo','4mo'))
+
+## abbreviate response categories
+abbreviate.response = function(x) c('Responder' = 'R', 'Non-responder' = 'NR', 'Non.responder' = 'NR')[x]
+
+set.seed(42)
+```
+
+# Figure 1: Study overview & RV1 responses
+
+Build panels for extended data figure 1, some of which are used in figure 1.
+```{r, fig.width = 6.5, fig.height = 7.5}
+library('cowplot')
+library('ggsignif')
+library('ggplot2')
+library('ggnewscale')
+library('ggpubr')
+library('svglite')
+library('ggbeeswarm')
+library('car')
+library('emmeans')
+library('lme4')
+
+
+load(file="initialized-dataset.RData")
+
+neutral_gray = '#444444'
+neutral_gray_light = hex(mixcolor(alpha = 0.5, color1 = hex2RGB(neutral_gray), color2 = hex2RGB('#FFFFFF')))
+neutral_gray_pale = hex(mixcolor(alpha = 0.5, color1 = hex2RGB(neutral_gray_light), color2 = hex2RGB('#FFFFFF')))
+```
+
+```{r}
+load(file='alpha-div.RData')
+load(file='beta-div.RData')
+
+
+fm = metadata[!(age > 30 & visit == 'NB') & !is.na(Seroconverted),] ## exclude >30day nb visits
+fm[!is.na(Seroconverted),table(country, visit)]
+
+cs_unfiltered_md = fm[
+     !duplicated(enrollment_id)
+   & !is.na(post_rota_sero_iga)
+   & !is.na(pre_rota_sero_iga)
+   
+    , .(enrollment_id, country
+      , Seroconverted
+      , seropositive_pre = pre_rota_sero_iga > 20
+      , seropositive_post = post_rota_sero_iga > 20
+      , rota_stool_pcr
+      , rota_sero_iga_fc
+      , log_rota_sero_iga_fc = log(rota_sero_iga_fc)
+      , post_rota_sero_iga
+      , log_post_rota_sero_iga = log(post_rota_sero_iga)
+      , pre_rota_sero_iga
+      , log_pre_rota_sero_iga = log(pre_rota_sero_iga)
+      , delivery
+      , gest_age
+      , Secretor
+      , inf_hispanic
+      , inf_birth_weight
+      , sex
+      )] %>% setkey(enrollment_id)
+
+```
+
+## combined pre/post jitter/boxplots
+```{r, fig.width = 5, fig.height = 3.5}
+
+## Run stats
+kw_pre = kruskal.test(
+  cs_unfiltered_md[,pre_rota_sero_iga] ~ cs_unfiltered_md[,country]
+)
+
+kw_pre %>% print()
+
+dunn_pre = DunnTest(
+  cs_unfiltered_md[,pre_rota_sero_iga] ~ cs_unfiltered_md[,country],
+  method = 'BH'
+)
+
+dunn_pre %>% print()
+
+kw_post = kruskal.test(
+  cs_unfiltered_md[,post_rota_sero_iga] ~ cs_unfiltered_md[,country]
+)
+
+kw_post %>% print()
+
+dunn_post = DunnTest(
+  cs_unfiltered_md[,post_rota_sero_iga] ~ cs_unfiltered_md[,country],
+  method = 'BH'
+)
+
+dunn_post %>% print()
+
+
+## pre post boxplots
+cs_data_prepost = rbind(
+     cs_unfiltered_md[, .(country, Seroconverted, val = log2(exp(log_pre_rota_sero_iga)), prepost = '1.pre')]
+   , cs_unfiltered_md[, .(country, Seroconverted, val = log2(exp(log_post_rota_sero_iga)), prepost = '2.post')]
+)
+
+## Custom axis defs
+vs = cs_data_prepost[,prepost] %>% unique()
+vl = length(vs)
+
+axl  = rep(factor(c('1.pre','2.post')), 2) %>% sort()
+
+## identify breaks by finding duped labels, from both directions (removing ends)
+idx = axl %>% rev() %>% duplicated() %>% not() %>% rev() %>% which()
+brk = axl %>% duplicated() %>% not() %>% which()
+
+## grab intersect and subtract half
+sep = data.frame(sep = intersect(idx + 1, brk) - 0.5)
+
+
+p3 = ggplot(cs_data_prepost) +
+    
+    geom_violin(aes(y = val
+                   , x = interaction(Seroconverted, prepost)  %>% factor() %>% as.numeric()
+                   , group = interaction(Seroconverted, prepost) 
+                   , fill = Seroconverted
+                   , color = Seroconverted)
+                 # , outlier.shape = NA
+                  ) +
+
+    geom_beeswarm(aes(y = val
+                  , x = interaction(Seroconverted, prepost) %>% factor() %>% as.numeric()
+                  , color = factor(Seroconverted)
+                  )
+                , size = 0.75
+                , dodge.width = 0.5
+                ) +
+    
+    scale_color_sero_outer +
+    scale_fill_sero_pale +
+
+    #geom_hline(yintercept = log2(20), linetype = 'dashed', color = neutral_gray) +
+    annotate(geom = 'segment', x = 2.5, xend = 2.5, y = -1.5, yend = 6.5, color = neutral_gray) +
+    annotate(geom = 'segment', x = 2.5, xend = 2.5, y = -4, yend = 9, linetype = 'dashed', color = neutral_gray) +
+    xlab('') +
+    scale_x_continuous(labels = setNames(c('M2','M6'), c('1.pre','2.post'))[vs], breaks = (idx + brk)/2) +
+    ylim(c(-5.039786, 15)) +
+    ggtitle('Pre- and post-vaccine\nanti-rotavirus serum IgA') +
+    
+    facet_grid(~country, scales = 'free_x') +
+    ylab('Anti-rotavirus\nserum IgA (log2(AU))') +
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) +
+    theme(panel.spacing = unit(0, "lines")) +
+    theme(legend.position = 'bottom'
+        , legend.title.position = 'top'
+        , panel.grid = element_blank()
+        , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+## Change facet label colors
+pdf(file = NULL)
+g = ggplot_gtable(ggplot_build(p3))
+dev.off()
+
+stripr <- which(grepl('strip-t', g$layout$name))
+fills <- col_pal_country_light
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k = k+1
+}
+
+pre_post_sero_boxplots = ggplotify::as.ggplot(g)
+
+plot(pre_post_sero_boxplots)
+```
+
+## foldchange boxplots2
+```{r, fig.width = 3, fig.height = 3.5}
+
+kw_fc = kruskal.test(
+  cs_unfiltered_md[,log_rota_sero_iga_fc],
+  cs_unfiltered_md[,factor(country)])
+
+dunn_fc = DunnTest(
+  cs_unfiltered_md[,log_rota_sero_iga_fc],
+  cs_unfiltered_md[,factor(country)],
+  method = 'BH')
+
+kw_fc %>% print()
+dunn_fc %>% print()
+
+pfc = ggplot(cs_unfiltered_md) +
+    geom_violin(aes(y = log2(exp(log_rota_sero_iga_fc))
+                   , x = country
+                   , color = Seroconverted
+                   , fill = Seroconverted)) +
+        
+    #scale_color_country_outer +
+    #scale_fill_country_pale +
+    
+    #new_scale_color() +
+    #new_scale_fill() +
+    
+    geom_hline(yintercept = log2(3), linetype = 'dashed', color = neutral_gray) +
+
+    geom_beeswarm(aes(y = log2(exp(log_rota_sero_iga_fc))
+                  , x = country
+                  , color = Seroconverted
+                  , fill = Seroconverted
+                  )
+                , size = 0.75
+                , dodge.width = 1
+                ) +
+    scale_color_sero_outer +
+    scale_fill_sero_inner +
+    ylim(c(-12, 12)) +
+    
+    xlab('') +
+    ylab('Anti-rotavirus serum IgA\nlog2-foldchange') +
+    ggtitle('Anti-rotavirus serum IgA foldchange') +
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) + theme(legend.position = 'none'
+                     , legend.title.position = 'top'
+                     , panel.grid = element_blank()) +
+    
+    theme(axis.text.y = element_text(angle = 0, hjust = 1, vjust = 0.5)
+        , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+fc_boxplots = pfc
+plot(fc_boxplots)
+```
+
+## Tabulation of N's per country / seroconversion status.
+```{r, fig.width = 4, fig.height = 2}
+## Tabulate
+source('table_header_bg.R') ## Functions for modification of table headers
+xt = fm[!is.na(Seroconverted), table(country, visit)] %>%
+    cbind('') %>%
+    cbind(cs_unfiltered_md[,table(country, Seroconverted)])
+
+xtabs = xt
+colnames(xtabs)[5:6] = c('Non','Sero')
+colnames(xtabs)[1:3] = relabely[colnames(xtabs)[1:3]] %>% as.character()
+
+cs_unfiltered_md[,table(country, Seroconverted)] %>% chisq.test()
+metadata[,table(country, visit)] %>% chisq.test()
+
+tbody.style = tbody_style(color = "black",
+   fill = c("white"), hjust=1, x=0.9)
+
+plot_xtab = ggtexttable(xtabs,
+           theme = ttheme(
+             tbody.style = tbody.style
+           )) %>%
+    table_cell_bg(row = 2, column = (1:ncol(xtabs))+1
+                  , fill= col_pal_country_pale[rownames(xtabs)[1]], color = 'white') %>%
+    table_cell_bg(row = 3, column = (1:ncol(xtabs))+1
+                  , fill= col_pal_country_pale[rownames(xtabs)[2]], color = 'white') %>%
+    table_cell_bg(row = 4, column = (1:ncol(xtabs))+1
+                  , fill= col_pal_country_pale[rownames(xtabs)[3]], color = 'white') %>%
+    table_cell_bg(row = 2:4, column = 4+1
+                  , fill= 'white', color = 'white') %>%
+    
+    table_cell_bg(row = (1:nrow(xtabs))+1, column = 6
+              , fill =  col_pal_sero_pale[colnames(xt)[5]], color = 'white') %>%
+    table_cell_bg(row = (1:nrow(xtabs))+1, column = 7
+              , fill =  col_pal_sero_pale[colnames(xt)[6]], color = 'white') %>%
+
+    table_header_bg(column = 5, fill = 'white', color = 'white') %>% 
+    table_header_bg(column = 6, fill = col_pal_sero_dark[colnames(xt)[5]], color = 'white') %>%
+    table_header_bg(column = 7, fill = col_pal_sero_dark[colnames(xt)[6]], color = 'white')
+
+print(plot_xtab)
+
+## stats
+cs_unfiltered_md[,table(Seroconverted, country)] %>% chisq.test()
+cs_unfiltered_md[,table(seropositive_pre, country)] %>% chisq.test()
+cs_unfiltered_md[,table(rota_stool_pcr, country)] %>% chisq.test()
+cs_unfiltered_md[,table(seropositive_post, country)] %>% chisq.test()
+```
+
+```{r, fig.width = 4, fig.height = 2}
+## Tabulate
+xt2 = cbind(cs_unfiltered_md[,table(country, seropositive_pre)]) %>%
+    cbind('') %>%
+    cbind(cs_unfiltered_md[,table(country, seropositive_post)]) %>%
+    cbind('') %>%
+    cbind(cs_unfiltered_md[,table(country, rota_stool_pcr)])
+
+xtabs = xt2
+colnames(xtabs)[1:2] = c('-','+')
+colnames(xtabs)[4:5] = c('-','+')
+colnames(xtabs)[7:8] = c('-','+')
+
+tbody.style = tbody_style(color = "black", size = 10, hjust=1, x=0.9)
+
+plot_xtab_addn = ggtexttable(xtabs,
+           theme = ttheme(
+             tbody.style = tbody.style
+           )) %>%
+    attr("ggtexttableGrob") %>% 
+    gtable_add_rows(heights = unit(2, "lines"), pos = 0) %>%
+    
+    add_spanner_label(2,3,label = 'M2\nSeropos', gp = gpar(fontsize = 10, fontface = "bold")) %>%
+    add_spanner_label(5,6,label = 'M6\nSeropos', gp = gpar(fontsize = 10, fontface = "bold")) %>%
+    add_spanner_label(8,9,label = 'M4\nShedding', gp = gpar(fontsize = 10, fontface = "bold")) %>%
+    
+    table_header_bg(column = 4, fill = 'white', color = 'white') %>% 
+    table_header_bg(column = 7, fill = 'white', color = 'white')
+
+plot(plot_xtab_addn)
+```
+
+## Pre and post IgA scatterplots + rho
+```{r, fig.width = 6.5, fig.height = 4}
+## Pre vs post per country
+## Calc spearman's corr for pre vs post
+pre_vs_post_rhos = cs_unfiltered_md[order(country),] %>%
+    split(by = 'country') %>%
+    lapply(function(x) cor.test(x[,log_pre_rota_sero_iga], x[,log_post_rota_sero_iga], method = 'spearman', exact = FALSE) %>% broom::tidy()) %>%
+    do.call('rbind',.)
+pre_vs_post_rhos$country = cs_unfiltered_md[order(country), country] %>% unique()
+
+## Exponent notation
+pre_vs_post_rhos = pre_vs_post_rhos %>%
+    mutate(pval = ifelse(p.value < 0.01
+                         , '<0.01'
+                         , paste0('= ', as.character(signif(p.value, digits=3))))) %>%
+    mutate(labs =  paste0('  P ', pval, '\n','  rho = ', round(estimate, 2)))
+
+p2 = ggplot(data = cs_unfiltered_md, aes(x = log2(exp(log_pre_rota_sero_iga))
+                                       , y = log2(exp(log_post_rota_sero_iga)))) +
+    geom_smooth(method = "loess", level = 0.95, aes(color = Seroconverted, fill = Seroconverted), family = 'gaussian', size= 0.75) +
+    #geom_smooth(aes(group = interaction(country, Seroconverted))
+    #        , method = "lm", se = FALSE, size = 0.75, color = neutral_gray) + 
+    geom_point(aes(color = Seroconverted), size = 0.75) +
+    scale_color_sero_outer +
+    scale_fill_sero_pale +
+    geom_text(data = pre_vs_post_rhos
+              , aes(label = labs)
+              , x = log2(exp(-4))
+              , y = log2(exp(7.5))
+              , hjust = 0, vjust = 1
+              , lineheight = 0.95
+              , color = neutral_gray) +
+    facet_grid(~country) +
+    coord_equal(ratio = 1) +
+    xlab('Anti-RV serum IgA at M2 (log2(AU))') +
+    ylab('Anti-RV serum IgA\nat M6 (log2(AU))') +
+    geom_hline(yintercept = log2(20), linetype = 'dashed', color = neutral_gray) +
+    geom_vline(xintercept = log2(20), linetype = 'dashed', color = neutral_gray) +
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) + 
+    theme(panel.spacing = unit(0, "lines")) +
+    theme(legend.position = 'left', legend.title.position = 'top', panel.grid = element_blank()) 
+
+## Change facet label colors
+pdf(file = NULL)
+    g = ggplot_gtable(ggplot_build(p2))
+dev.off()
+
+stripr <- which(grepl('strip-t', g$layout$name))
+fills <- col_pal_country_light
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k = k+1
+}
+
+pre_post_iga_scatters = ggplotify::as.ggplot(g)
+
+plot(pre_post_iga_scatters)
+
+fwrite(cs_unfiltered_md[,.(country
+                                 , M2_iga = log2(exp(log_pre_rota_sero_iga))
+                                 , M6_iga = log2(exp(log_post_rota_sero_iga)))], 'source-data/ed-fig1/pre-vs-post-iga.txt.xls', sep='\t')
+
+```
+```{r, fig.width = 6.5, fig.height = 4}
+## Pre vs post per country
+## Calc spearman's corr for pre vs post
+pre_vs_post_rhos = cs_unfiltered_md[order(country),] %>%
+    (function(x) cor.test(x[,log_pre_rota_sero_iga], x[,log_post_rota_sero_iga], method = 'spearman', exact = FALSE) %>% broom::tidy())
+
+## Exponent notation
+pre_vs_post_rhos = pre_vs_post_rhos %>%
+    mutate(pval = ifelse(p.value < 0.01
+                         , '<0.01'
+                         , paste0('= ', as.character(signif(p.value, digits=3))))) %>%
+    mutate(labs =  paste0('  P ', pval, '\n','  rho = ', round(estimate, 2)))
+
+p2 = ggplot(data = cs_unfiltered_md, aes(
+    x = log2(exp(log_pre_rota_sero_iga))
+  , y = log2(exp(log_post_rota_sero_iga)))) +
+    geom_smooth(method = "loess", level = 0.95, aes(color = Seroconverted, fill = Seroconverted), family = 'gaussian', size= 0.75) +
+    #geom_smooth(aes(group = interaction(country, Seroconverted))
+    #        , method = "lm", se = FALSE, size = 0.75, color = neutral_gray) + 
+    geom_point(aes(color = Seroconverted), size = 0.75) +
+    scale_color_sero_outer +
+    scale_fill_sero_pale +
+    geom_text(data = pre_vs_post_rhos
+              , aes(label = labs)
+              , x = log2(exp(-4))
+              , y = log2(exp(7.5))
+              , hjust = 0, vjust = 1
+              , lineheight = 0.95
+              , color = neutral_gray) +
+    coord_equal(ratio = 1) +
+    xlab('Anti-RV serum IgA at M2 (log2(AU))') +
+    ylab('Anti-RV serum IgA\nat M6 (log2(AU))') +
+    geom_hline(yintercept = log2(20), linetype = 'dashed', color = neutral_gray) +
+    geom_vline(xintercept = log2(20), linetype = 'dashed', color = neutral_gray) +
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) + 
+    theme(panel.spacing = unit(0, "lines")) +
+    theme(legend.position = 'right', legend.title.position = 'top', panel.grid = element_blank()) 
+
+pre_post_iga_scatters_total = p2
+
+plot(pre_post_iga_scatters_total)
+
+```
+
+
+## Microbiome sampling events, box/jitter
+```{r, fig.width = 5, fig.height = 2.5}
+## Build event table
+event_tabs = filtered_metadata[,.(enrollment_id, Seroconverted, event = 'sgmg', age, country, visit)] %>% na.omit()
+
+## Additional violins
+p3 = ggplot() +
+    geom_violin(data = event_tabs[event == 'sgmg' & visit == 'NB',]
+               , aes(x = age, y = Seroconverted, fill = visit, color = visit)
+               , outlier.shape = NA) +
+    
+    geom_violin(data = event_tabs[event == 'sgmg' & visit == '2mo',]
+               , aes(x = age, y = Seroconverted, fill = visit, color = visit)
+               , outlier.shape = NA) +
+    
+    geom_violin(data = event_tabs[event == 'sgmg' & visit == '4mo',]
+               , aes(x = age, y = Seroconverted, fill = visit, color = visit)
+               , outlier.shape = NA) +
+        
+    geom_beeswarm(data = event_tabs[event == 'sgmg',]
+               , aes(x = age, y = Seroconverted, color = visit)
+               , size = 0.8) +
+    
+    facet_grid(country~., scales = 'free', space = 'free') +
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) +
+    xlab('Age at stool sample collection') +
+    scale_x_continuous(limits = c(0, 180), expand = c(0,0)) +
+    scale_y_discrete(labels = abbreviate.response(names(col_pal_sero_dark))) +
+    scale_color_visit_outer +
+    scale_fill_visit_pale +
+    geom_vline(xintercept = c(30, 100), color = neutral_gray, linetype = 'dashed') +
+    theme(
+        , legend.position = 'none'
+        , panel.grid = element_blank()
+        #, plot.margin = margin(0, 0, 0, 0, "cm")
+        ) +
+    theme(panel.spacing = unit(0, "lines"))
+
+## Change facet label colors
+pdf(file = NULL)
+    g = ggplot_gtable(ggplot_build(p3))
+dev.off()
+
+stripr <- which(grepl('strip-r', g$layout$name))
+fills <- col_pal_country_light
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k = k+1
+}
+
+sampling_event_boxplots = ggplotify::as.ggplot(g)
+
+plot(sampling_event_boxplots)
+```
+
+
+## Render figure 1
+```{r, fig.width = 6.5, fig.height = 3.5}
+## rows of plots
+r1 = plot_grid('', plot_xtab, labels = c('A','B'))
+
+r2 = plot_grid(pre_post_sero_boxplots, fc_boxplots, ncol = 2, labels = c('C','D'), rel_widths = c(1, 1))
+
+#r31 = plot_grid(plot_allv_ords,'',rel_heights = c(1, 0.01), nrow = 2)
+
+#r3 = plot_grid(SR_emm_plot2, r31, rel_widths = c(1.25,2), ncol = 2)
+
+#pg = plot_grid(r1, r2, r3, nrow = 3, rel_heights = c(0.5, 1, 1))
+
+
+#svglite('figures/figure-1.svg', width = 6.5, height = 7.5, fix_text_size =  FALSE)
+#    plot(pg2)
+#dev.off()
+
+
+svglite('figures/figure-1AB.svg', width = 6.5, height = 2.5, fix_text_size =  FALSE)
+    plot(r1)
+dev.off()
+
+
+svglite('figures/figure-1CD.svg', width = 6.5, height = 3.5, fix_text_size =  FALSE)
+    plot(r2)
+dev.off()
+
+
+#svglite('figures/figure-1EF.svg', width = 7.5, height = 3, fix_text_size =  FALSE)
+#    plot(r3)
+#dev.off()
+
+
+fwrite(cs_unfiltered_md[,.(enrollment_id, country, Seroconverted, log_pre_rota_sero_iga, log_post_rota_sero_iga, rota_sero_iga_fc, rota_stool_pcr)], 'source-data/fig1/rv1-responses.txt.xls', sep='\t')
+
+plot(r1)
+plot(r2)
+#plot(r3)
+```
+
+
+## Render extended data figure 1
+```{r, fig.height = 5.5, fig.width = 6.5}
+pd1 = plot_grid(pre_post_iga_scatters_total, pre_post_iga_scatters, labels = c('A','B'), ncol = 1, rel_heights = c(1.5, 1.25))
+plot(pd1)
+
+svglite('figures/figure-extended-data-additionalsero.svg', width = 6.5, height = 5.5, fix_text_size = FALSE)
+    plot(pd1)
+dev.off()
+
+```
+
+
+# Figure 2: Community diversity analysis overview wrt seroconversion
+
+## Alpha diversity boxplots
+```{r, fig.width = 3, fig.height = 3}
+
+pab = ggplot(alphadivnona) +
+    geom_violin(aes(y = log10(SR)
+                   , x = relabely[visit]
+                   #, fill = visit
+                   #, color = visit
+                   )
+                 , fill = neutral_gray_pale
+                 , color = neutral_gray
+                 , outlier.shape = NA) +
+    
+    geom_beeswarm(aes(y = log10(SR)
+                  , x = relabely[visit]
+                  #, color = factor(visit)
+                  )
+                  , color = neutral_gray
+                , size = 0.75
+                , dodge.width = 0.5
+                ) +
+    #scale_color_visit_outer +
+    #scale_fill_visit_pale +
+    facet_grid(~country) +
+
+    xlab('') +
+    ylab('log10(OGU Richness)') +
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) + theme(legend.position = 'bottom'
+                     , legend.title.position = 'top'
+                     , panel.grid = element_blank()) +
+    theme(panel.spacing = unit(0, "lines")) +
+    theme(axis.text.y = element_text(angle = 0, hjust = 0, vjust = 0.5)
+        , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+## Change facet label colors
+pdf(file = NULL)
+g = ggplot_gtable(ggplot_build(pab))
+dev.off()
+stripr <- which(grepl('strip-t', g$layout$name))
+fills <- col_pal_country_light
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k = k+1
+}
+
+alpha_boxplots_country = g
+
+plot(alpha_boxplots_country)
+```
+
+## Emmeans for ogu richness
+```{r, fig.width = 3, fig.height = 2.5}
+lmm_modl_fit = function(data, result_term, fixedeff, randeff, label)
+{
+    random_int = lapply(randeff, function(x) paste0('1 | ', x)) %>% lapply(enclose)
+    
+    fixed_effects_terms = paste0(fixedeff, collapse = ' + ')
+    
+    rand_int_terms = random_int %>% 
+                        unlist() %>% 
+                        unique() %>% 
+                        paste0(collapse = ' + ')
+    
+    effect_terms = paste0(fixed_effects_terms, ' + ', rand_int_terms)
+    fullform = as.formula(paste0(result_term, ' ~ 1 + ', effect_terms))
+    fullmodl = lmer(fullform, data = data, REML = FALSE, na.action = 'na.fail')
+
+    return(fullmodl)
+}
+
+fixedeff = c('formula_bm', 'visit', 'abx_status', 'country', 'sex'
+             , 'inf_birth_weight', 'gest_age', 'delivery'
+             , 'Seroconverted', 'Secretor')
+
+SR_modl = lmm_modl_fit(alphadivnona, 'log(SR)', fixedeff, randeff, label = 'OGU Richness')
+
+SR_emms = emmeans(SR_modl, ~ visit + country)
+SR_emm_df = as.data.frame(SR_emms)
+
+# Plot EMMs with confidence intervals using ggplot2
+SR_emm_plot = ggplot(SR_emm_df, aes(x = relabely[visit], y = emmean, group = relabely[visit])) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL),
+            width = 0.15,
+            position = position_dodge(width = 1)) +
+  geom_line(aes(group = country), position = position_dodge(width = 1)) +
+  geom_point(aes(color = visit), position = position_dodge(width = 1), size = 2) +
+  labs(x = "Country", y = "log10(SR) emmeans",
+       color = "Visit") +
+  scale_color_visit_outer +
+  facet_grid(~country) +
+    
+  xlab('') +
+    ylab('log-OGU Richness emmean') +
+    theme_bw() +
+    theme(plot.title = element_text(size=11)) +
+    theme(legend.position = 'none'
+                 , legend.title.position = 'top'
+                 , panel.grid = element_blank()) +
+    theme(panel.spacing = unit(0, 'lines')) +
+    theme(axis.text.y = element_text(angle = 0, hjust = 0, vjust = 0.5)
+    , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+## Change facet label colors
+pdf(file = NULL)
+g = ggplot_gtable(ggplot_build(SR_emm_plot))
+dev.off()
+stripr <- which(grepl('strip-t', g$layout$name))
+fills <- col_pal_country_light
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k = k+1
+}
+
+SR_emm_plot2 = g
+
+plot(SR_emm_plot2)
+
+```
+
+## Additional alpha divs plots
+### SR
+```{r, fig.width = 3, fig.height = 2.5}
+
+pab2 = ggplot(alphadivnona) +
+    geom_violin(aes(y = log10(SR)
+                   , x = relabely[visit]
+                   , fill = visit
+                   , color = visit
+                   )
+                 #, fill = neutral_gray_pale
+                 #, color = neutral_gray
+                 , outlier.shape = NA) +
+    
+    geom_beeswarm(aes(y = log10(SR)
+                  , x = relabely[visit]
+                  , color = factor(visit)
+                  )
+                , size = 0.75
+                , dodge.width = 0.5
+                ) +
+    scale_color_visit_outer +
+    scale_fill_visit_pale +
+    facet_grid(~country) +
+
+    xlab('') +
+    ylab('log10(OGU Richness)') +
+    theme_bw() +
+    theme(plot.title = element_text(size=11)) +
+    theme(legend.position = 'none'
+                     , legend.title.position = 'top'
+                     , panel.grid = element_blank()) +
+    theme(panel.spacing = unit(0, 'lines')) +
+    theme(axis.text.y = element_text(angle = 0, hjust = 0, vjust = 0.5)
+        , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+## Change facet label colors
+pdf(file = NULL)
+g = ggplot_gtable(ggplot_build(pab2))
+dev.off()
+stripr <- which(grepl('strip-t', g$layout$name))
+fills <- col_pal_country_light
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k = k+1
+}
+
+alpha_violins_country1 = g
+
+plot(alpha_violins_country1)
+```
+
+### Emmeans for ogu richness
+```{r, fig.width = 3, fig.height = 2.5}
+
+SR_modl = lmm_modl_fit(alphadivnona, 'log(SR)', fixedeff, randeff, label = 'OGU Richness')
+
+SR_emms = emmeans(SR_modl, ~ visit + country)
+SR_emm_df = as.data.frame(SR_emms)
+
+# Plot EMMs with confidence intervals using ggplot2
+SR_emm_plot = ggplot(SR_emm_df, aes(x = relabely[visit], y = emmean, group = relabely[visit])) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL),
+            width = 0.15,
+            position = position_dodge(width = 1)) +
+  geom_line(aes(group = country), position = position_dodge(width = 1)) +
+  geom_point(aes(color = visit), position = position_dodge(width = 1), size = 2) +
+  labs(x = "Country", y = "log10(SR) emmeans",
+       color = "Visit") +
+  scale_color_visit_outer +
+  facet_grid(~country) +
+    
+  xlab('') +
+    ylab('log-OGU Richness emmean') +
+    theme_bw() +
+    theme(plot.title = element_text(size=11)) +
+    theme(legend.position = 'none'
+                 , legend.title.position = 'top'
+                 , panel.grid = element_blank()) +
+    theme(panel.spacing = unit(0, 'lines')) +
+    theme(axis.text.y = element_text(angle = 0, hjust = 0, vjust = 0.5)
+    , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+## Change facet label colors
+pdf(file = NULL)
+g = ggplot_gtable(ggplot_build(SR_emm_plot))
+dev.off()
+stripr <- which(grepl('strip-t', g$layout$name))
+fills <- col_pal_country_light
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k = k+1
+}
+
+SR_emm_plot2 = g
+
+plot(SR_emm_plot2)
+
+```
+
+### Simpson
+```{r, fig.width = 3, fig.height = 2.5}
+
+pab2 = ggplot(alphadivnona) +
+    geom_violin(aes(y = logit(simpson)
+                   , x = relabely[visit]
+                   , fill = visit
+                   , color = visit
+                   )
+                 #, fill = neutral_gray_pale
+                 #, color = neutral_gray
+                 , outlier.shape = NA) +
+    
+    geom_beeswarm(aes(y = logit(simpson)
+                  , x = relabely[visit]
+                  , color = factor(visit)
+                  )
+                , size = 0.75
+                , dodge.width = 0.5
+                ) +
+    scale_color_visit_outer +
+    scale_fill_visit_pale +
+    facet_grid(~country) +
+
+    xlab('') +
+    ylab('logit(Simpson)') +
+    theme_bw() +
+    theme(plot.title = element_text(size=11)) +
+    theme(legend.position = 'none'
+                     , legend.title.position = 'top'
+                     , panel.grid = element_blank()) +
+    theme(panel.spacing = unit(0, 'lines')) +
+    theme(axis.text.y = element_text(angle = 0, hjust = 0, vjust = 0.5)
+        , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+## Change facet label colors
+pdf(file = NULL)
+g = ggplot_gtable(ggplot_build(pab2))
+dev.off()
+stripr <- which(grepl('strip-t', g$layout$name))
+fills <- col_pal_country_light
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k = k+1
+}
+
+alpha_violins_country2 = g
+
+plot(alpha_violins_country2)
+```
+
+
+### Emmeans for simpson
+```{r, fig.width = 3, fig.height = 2.5}
+fixedeff = c('formula_bm', 'visit', 'abx_status', 'country', 'sex'
+             , 'inf_birth_weight', 'gest_age', 'delivery'
+             , 'Seroconverted', 'Secretor')
+
+simpson_modl = lmm_modl_fit(alphadivnona, 'logit(simpson)', fixedeff, randeff)
+
+simpson_emms = emmeans(simpson_modl, ~ visit + country)
+simpson_emm_df = as.data.frame(simpson_emms)
+
+# Plot EMMs with confidence intervals using ggplot2
+simpson_emm_plot = ggplot(simpson_emm_df, aes(x = relabely[visit], y = emmean, group = relabely[visit])) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL),
+            width = 0.15,
+            position = position_dodge(width = 1)) +
+  geom_line(aes(group = country), position = position_dodge(width = 1)) +
+  geom_point(aes(color = visit), position = position_dodge(width = 1), size = 2) +
+  labs(x = "Country", y = "logit(simpson) emmeans",
+       color = "Visit") +
+  scale_color_visit_outer +
+  facet_grid(~country) +
+    
+  xlab('') +
+    ylab('logit-simpson emmean') +
+    theme_bw() +
+    theme(plot.title = element_text(size=11)) +
+    theme(legend.position = 'none'
+                 , legend.title.position = 'top'
+                 , panel.grid = element_blank()) +
+    theme(panel.spacing = unit(0, 'lines')) +
+    theme(axis.text.y = element_text(angle = 0, hjust = 0, vjust = 0.5)
+    , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+## Change facet label colors
+pdf(file = NULL)
+g = ggplot_gtable(ggplot_build(simpson_emm_plot))
+dev.off()
+stripr <- which(grepl('strip-t', g$layout$name))
+fills <- col_pal_country_light
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k = k+1
+}
+
+simpson_emm_plot2 = g
+
+plot(simpson_emm_plot2)
+
+```
+
+### PD
+```{r, fig.width = 3, fig.height = 2.5}
+
+pab3 = ggplot(alphadivnona) +
+    geom_violin(aes(y = log(PD)
+                   , x = relabely[visit]
+                   , fill = visit
+                   , color = visit)
+                 , outlier.shape = NA) +
+    
+    geom_beeswarm(aes(y = log(PD)
+                  , x = relabely[visit]
+                  , color = factor(visit)
+                  )
+                , size = 0.75
+                , dodge.width = 0.5
+                ) +
+    scale_color_visit_outer +
+    scale_fill_visit_pale +
+    facet_grid(~country) +
+
+    xlab('') +
+    ylab('log(PD)') +
+    theme_bw() +
+    theme(plot.title = element_text(size=11)) +
+    theme(legend.position = 'none'
+                     , legend.title.position = 'top'
+                     , panel.grid = element_blank()) +
+    theme(panel.spacing = unit(0, 'lines')) +
+    theme(axis.text.y = element_text(angle = 0, hjust = 0, vjust = 0.5)
+        , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+## Change facet label colors
+pdf(file = NULL)
+g = ggplot_gtable(ggplot_build(pab3))
+dev.off()
+stripr <- which(grepl('strip-t', g$layout$name))
+fills <- col_pal_country_light
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k = k+1
+}
+
+alpha_violins_country3 = g
+
+plot(alpha_violins_country3)
+```
+
+### Emmeans for PD
+```{r, fig.width = 3, fig.height = 2.5}
+fixedeff = c('formula_bm', 'visit', 'abx_status', 'country', 'sex'
+             , 'inf_birth_weight', 'gest_age', 'delivery'
+             , 'Seroconverted', 'Secretor')
+
+PD_modl = lmm_modl_fit(alphadivnona, 'log(PD)', fixedeff, randeff)
+
+PD_emms = emmeans(PD_modl, ~ visit + country)
+PD_emm_df = as.data.frame(PD_emms)
+
+# Plot EMMs with confidence intervals using ggplot2
+PD_emm_plot = ggplot(PD_emm_df, aes(x = relabely[visit], y = emmean, group = relabely[visit])) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL),
+            width = 0.15,
+            position = position_dodge(width = 1)) +
+  geom_line(aes(group = country), position = position_dodge(width = 1)) +
+  geom_point(aes(color = visit), position = position_dodge(width = 1), size = 2) +
+  labs(x = "Country", y = "log(PD) emmeans",
+       color = "Visit") +
+  scale_color_visit_outer +
+  facet_grid(~country) +
+    
+    xlab('') +
+    ylab('log-PD emmean') +
+    theme_bw() +
+    theme(plot.title = element_text(size=11)) +
+    theme(legend.position = 'none'
+                 , legend.title.position = 'top'
+                 , panel.grid = element_blank()) +
+    theme(panel.spacing = unit(0, 'lines')) +
+    theme(axis.text.y = element_text(angle = 0, hjust = 0, vjust = 0.5)
+    , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+## Change facet label colors
+pdf(file = NULL)
+g = ggplot_gtable(ggplot_build(PD_emm_plot))
+dev.off()
+stripr <- which(grepl('strip-t', g$layout$name))
+fills <- col_pal_country_light
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k = k+1
+}
+
+PD_emm_plot2 = g
+
+plot(PD_emm_plot2)
+
+```
+
+### EMR
+```{r, fig.width = 3, fig.height = 2.5}
+
+pab4 = ggplot(alphadivnona) +
+    geom_violin(aes(y = log(EMR)
+                   , x = relabely[visit]
+                   , fill = visit
+                   , color = visit)
+                 , outlier.shape = NA) +
+    
+    geom_beeswarm(aes(y = log(EMR)
+                  , x = relabely[visit]
+                  , color = factor(visit)
+                  )
+                , size = 0.75
+                , dodge.width = 0.5
+                ) +
+    scale_color_visit_outer +
+    scale_fill_visit_pale +
+    facet_grid(~country) +
+
+    xlab('') +
+    ylab('Eff. Micr. Rich.') +
+    theme_bw() +
+    theme(plot.title = element_text(size=11)) +
+    theme(legend.position = 'none'
+                     , legend.title.position = 'top'
+                     , panel.grid = element_blank()) +
+    theme(panel.spacing = unit(0, 'lines')) +
+    theme(axis.text.y = element_text(angle = 0, hjust = 0, vjust = 0.5)
+        , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+## Change facet label colors
+pdf(file = NULL)
+g = ggplot_gtable(ggplot_build(pab4))
+dev.off()
+stripr <- which(grepl('strip-t', g$layout$name))
+fills <- col_pal_country_light
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k = k+1
+}
+
+alpha_violins_country4 = g
+
+plot(alpha_violins_country4)
+```
+
+### Emmeans for EMR
+```{r, fig.width = 3, fig.height = 2.5}
+fixedeff = c('formula_bm', 'visit', 'abx_status', 'country', 'sex'
+             , 'inf_birth_weight', 'gest_age', 'delivery'
+             , 'Seroconverted', 'Secretor')
+
+EMR_modl = lmm_modl_fit(alphadivnona, 'log(EMR)', fixedeff, randeff)
+
+EMR_emms = emmeans(EMR_modl, ~ visit + country)
+EMR_emm_df = as.data.frame(EMR_emms)
+
+# Plot EMMs with confidence intervals using ggplot2
+EMR_emm_plot = ggplot(EMR_emm_df, aes(x = relabely[visit], y = emmean, group = relabely[visit])) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL),
+            width = 0.15,
+            position = position_dodge(width = 1)) +
+  geom_line(aes(group = country), position = position_dodge(width = 1)) +
+  geom_point(aes(color = visit), position = position_dodge(width = 1), size = 2) +
+  labs(x = "Country", y = "log(EMR) emmeans",
+       color = "Visit") +
+  scale_color_visit_outer +
+  facet_grid(~country) +
+    
+    xlab('') +
+    ylab('log-EMR emmean') +
+    theme_bw() +
+    theme(plot.title = element_text(size=11)) +
+    theme(legend.position = 'none'
+                 , legend.title.position = 'top'
+                 , panel.grid = element_blank()) +
+    theme(panel.spacing = unit(0, 'lines')) +
+    theme(axis.text.y = element_text(angle = 0, hjust = 0, vjust = 0.5)
+    , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+## Change facet label colors
+pdf(file = NULL)
+g = ggplot_gtable(ggplot_build(EMR_emm_plot))
+dev.off()
+stripr <- which(grepl('strip-t', g$layout$name))
+fills <- col_pal_country_light
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k = k+1
+}
+
+EMR_emm_plot2 = g
+
+plot(EMR_emm_plot2)
+
+```
+
+### Shannon
+```{r, fig.width = 3, fig.height = 3.5}
+
+pab5 = ggplot(alphadivnona) +
+    geom_violin(aes(y = shannon
+                   , x = relabely[visit]
+                   , fill = visit
+                   , color = visit)
+                 , outlier.shape = NA) +
+    
+    geom_beeswarm(aes(y = shannon
+                  , x = relabely[visit]
+                  , color = factor(visit)
+                  )
+                , size = 0.75
+                , dodge.width = 0.5
+                ) +
+    scale_color_visit_outer +
+    scale_fill_visit_pale +
+    facet_grid(~country) +
+
+    xlab('') +
+    ylab('Shannon') +
+    theme_bw() +
+    theme(plot.title = element_text(size=11)) +
+    theme(legend.title.position = 'top'
+                     , legend.position = 'bottom'
+                     , panel.grid = element_blank()) +
+    theme(panel.spacing = unit(0, 'lines')) +
+    theme(axis.text.y = element_text(angle = 0, hjust = 0, vjust = 0.5)
+        , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+## Change facet label colors
+pdf(file = NULL)
+g = ggplot_gtable(ggplot_build(pab5))
+dev.off()
+stripr <- which(grepl('strip-t', g$layout$name))
+fills <- col_pal_country_light
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k = k+1
+}
+
+alpha_violins_country5 = g
+
+plot(alpha_violins_country5)
+```
+
+### Emmeans for Shannon
+```{r, fig.width = 3, fig.height = 2.5}
+fixedeff = c('formula_bm', 'visit', 'abx_status', 'country', 'sex'
+             , 'inf_birth_weight', 'gest_age', 'delivery'
+             , 'Seroconverted', 'Secretor')
+
+Shannon_modl = lmm_modl_fit(alphadivnona, 'shannon', fixedeff, randeff)
+
+Shannon_emms = emmeans(Shannon_modl, ~ visit + country)
+Shannon_emm_df = as.data.frame(Shannon_emms)
+
+# Plot EMMs with confidence intervals using ggplot2
+Shannon_emm_plot = ggplot(Shannon_emm_df, aes(x = relabely[visit], y = emmean, group = relabely[visit])) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL),
+            width = 0.15,
+            position = position_dodge(width = 1)) +
+  geom_line(aes(group = country), position = position_dodge(width = 1)) +
+  geom_point(aes(color = visit), position = position_dodge(width = 1), size = 2) +
+  labs(x = "Country", y = "Shannon emmeans",
+       color = "Visit") +
+  scale_color_visit_outer +
+  facet_grid(~country) +
+    
+    xlab('') +
+    ylab('Shannon emmean') +
+    theme_bw() +
+    theme(plot.title = element_text(size=11)) +
+    theme(legend.position = 'none'
+                 , legend.title.position = 'top'
+                 , panel.grid = element_blank()) +
+    theme(panel.spacing = unit(0, 'lines')) +
+    theme(axis.text.y = element_text(angle = 0, hjust = 0, vjust = 0.5)
+    , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+## Change facet label colors
+pdf(file = NULL)
+g = ggplot_gtable(ggplot_build(Shannon_emm_plot))
+dev.off()
+stripr <- which(grepl('strip-t', g$layout$name))
+fills <- col_pal_country_light
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k = k+1
+}
+
+Shannon_emm_plot2 = g
+
+plot(Shannon_emm_plot2)
+
+```
+
+## Alpha divs supp fig
+```{r, fig.height = 10, fig.width = 6}
+alpha_divs_supp_fig = plot_grid(
+          plot_grid(alpha_violins_country1, SR_emm_plot2)
+        , plot_grid(alpha_violins_country2, simpson_emm_plot2)
+        , plot_grid(alpha_violins_country3, PD_emm_plot2)
+        , plot_grid(alpha_violins_country4, EMR_emm_plot2)
+        , plot_grid(alpha_violins_country5, plot_grid(Shannon_emm_plot2,'', rel_heights = c(6, 2), ncol = 1))
+        , labels = c('A', 'B', 'C', 'D', 'E')
+        , nrow = 5, ncol = 1, rel_heights = c(2, 2,
+                                              2, 2, 3)
+        )
+
+
+svglite('figures/figure-supp-alpha.svg', width = 6.5, height = 10, fix_text_size = FALSE)
+    plot(alpha_divs_supp_fig)
+dev.off()
+```
+
+## Beta diversity ordinations, longitudinal
+```{r, fig.width = 5, fig.height = 3}
+library('ape')
+library('lme4')
+library('emmeans')
+library('vegan')
+
+ords = ape::pcoa(vegdist(spp_clr[rownames(rdacounts),], method = 'euclidean'))
+setkey(rdamd, sample_name)
+ord_data = cbind(ords$vectors, rdamd[rownames(ords$vectors),])
+
+ord_data[,visit.centroid.Axis.1 := median(Axis.1), by = .(visit)]
+ord_data[,visit.centroid.Axis.2 := median(Axis.2), by = .(visit)]
+ord_data[,country.centroid.Axis.1 := median(Axis.1), by = .(country)]
+ord_data[,country.centroid.Axis.2 := median(Axis.2), by = .(country)]
+
+## Background ellipses
+p1 = ggplot(data = ord_data) +
+    stat_ellipse(mapping = aes(fill = visit, x = Axis.1, y = Axis.2)
+                 , geom = "polygon", alpha = 0.15, show.legend = FALSE)
+    
+## Add spiders
+#for(vi in ord_data[,visit] %>% unique()) p1 = p1 +
+#    geom_segment(data = ord_data[visit == vi,]
+#               , mapping = aes(
+#                   x = Axis.1, xend = visit.centroid.Axis.1
+#                 , y = Axis.2, yend = visit.centroid.Axis.2
+#                 , color = visit)
+#               , alpha = 0.25
+#               , size = 0.65)
+
+## Add in points
+p1 = p1 + geom_point(mapping = aes(
+               x = Axis.1
+             , y = Axis.2
+             , color = visit)
+             , size = 0.8)
+
+## Centroids
+for(vi in ord_data[,visit] %>% unique()) p1 = p1 +
+    geom_point(data = ord_data[visit == vi,][!duplicated(visit),]
+             , mapping = aes(
+                 x = visit.centroid.Axis.1
+               , y = visit.centroid.Axis.2
+               , fill = visit)
+             , color = neutral_gray
+             , size = 2.5
+             , shape = 21)
+
+## Pvalues for this var
+p1 = p1 + annotate(geom = 'text'
+                 , x = -55, y = 55
+                 , label = 'P <0.01\nF = 2.15'
+                 , hjust = 0, vjust = 1
+              , lineheight = 0.95
+              , color = neutral_gray)
+
+## Theme elements
+p1 = p1 +
+    scale_color_visit_outer +
+    scale_fill_visit_outer +
+    
+    xlab('Axis1') +
+    ylab('Axis2') +
+    theme_bw() + 
+    theme(plot.title = element_text(size=11), legend.title = element_text(size=11)) +
+    ylim(c(-55, 55)) +
+    xlim(c(-55, 55)) +
+    coord_equal() +
+    theme(legend.position = 'bottom'
+        , legend.title.position = 'top'
+        , panel.grid = element_blank()
+        , legend.text = element_text(margin = margin(l=unit(0.05, 'cm')))
+        , legend.spacing.y = unit(0,'cm')
+        , legend.key.spacing.x = unit(0.1,'cm')
+        )
+
+## By country
+
+## Background ellipses
+p2 = ggplot(data = ord_data) +
+    stat_ellipse(mapping = aes(fill = country, x = Axis.1, y = Axis.2)
+              , geom = "polygon", alpha = 0.15, show.legend = FALSE)
+    
+## Add spiders
+#for(co in ord_data[,country] %>% unique()) p2 = p2 +
+#    geom_segment(data = ord_data[country == co,]
+#               , mapping = aes(
+#                   x = Axis.1, xend = country.centroid.Axis.1
+#                 , y = Axis.2, yend = country.centroid.Axis.2
+#                 , color = country)
+#               , alpha = 0.25
+#               , size = 0.65)
+
+## Add in points
+p2 = p2 + geom_point(mapping = aes(
+               x = Axis.1
+             , y = Axis.2
+             , color = country)
+             , size = 0.8)
+
+## Centroids
+for(co in ord_data[,country] %>% unique()) p2 = p2 +
+    geom_point(data = ord_data[country == co,][!duplicated(country),]
+             , mapping = aes(
+                 x = country.centroid.Axis.1
+               , y = country.centroid.Axis.2
+               , fill = country)
+             , color = neutral_gray
+             , size = 2.5
+             , shape = 21)
+
+p2 = p2 + annotate(geom = 'text'
+                 , x = -55, y = 55
+                 , label = 'P <0.01\n F = 3.36'
+                 , hjust = 0, vjust = 1
+                 , lineheight = 0.95
+                 , color = neutral_gray)
+
+## Theme elements
+p2 = p2 +
+    scale_color_country_outer +
+    scale_fill_country_outer +
+    
+    xlab('Axis1') +
+    ylab('') +
+    ylim(c(-55, 55)) +
+    xlim(c(-55, 55)) +
+    theme_bw() +
+    coord_equal() +
+    theme(plot.title = element_text(size=11), legend.title = element_text(size=11)) +
+    theme(legend.position = 'bottom'
+        , legend.title.position = 'top'
+        , panel.grid = element_blank()
+        , legend.text = element_text(margin = margin(l=unit(0.05, 'cm')))
+        , legend.spacing.y = unit(0,'cm')
+        , legend.key.spacing.x = unit(0.1,'cm')
+        )
+
+allv_ords_visit = p1 + ggtitle('Aitchison PCoA, Month')
+allv_ords_country = p2 + ggtitle('Aitchison PCoA, Country')
+plot_allv_ords = plot_grid(p1 + ggtitle('Aitchison PCoA, Month')
+                         , p2 + ggtitle('Aitchison PCoA, Country'))
+## All aitchison ordination plots
+plot(plot_allv_ords)
+```
+
+
+## Emmeans for ogu richness + sero
+```{r, fig.width = 3, fig.height = 2.5}
+vs = alphadivdata[,Seroconverted] %>% unique() %>% na.omit()
+vl = length(vs)
+
+axl  = rep(abbreviate.response(vs) %>% unique(), 2) %>% sort()
+
+## identify breaks by finding duped labels, from both directions (removing ends)
+idx = axl %>% rev() %>% duplicated() %>% not() %>% rev() %>% which()
+brk = axl %>% duplicated() %>% not() %>% which()
+
+sero_modl = lmm_modl_fit(alphadivnona, 'log(SR)', fixedeff, randeff, label = 'OGU Richness')
+
+sero_emms = emmeans(sero_modl, ~ visit + country + Seroconverted)
+sero_emm_df = as.data.frame(sero_emms)
+
+# Plot EMMs with confidence intervals using ggplot2
+sero_emm_plot = ggplot(sero_emm_df, aes(x = interaction(visit, abbreviate.response(Seroconverted))# %>%
+                                         #  factor() %>%
+                                          # as.numeric()
+                                    , y = emmean
+                                    , group = Seroconverted)) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL),
+            width = 0.15,
+            position = position_dodge(width = 1)) +
+  geom_line(aes(group = interaction(country, Seroconverted)), position = position_dodge(width = 1)) +
+  geom_point(aes(color = visit), position = position_dodge(width = 1), size = 2) +
+  labs(color = "Visit") +
+  scale_color_visit_outer +
+  facet_grid(~country) +
+    
+  xlab('') +
+  #scale_x_continuous(labels = abbreviate.response(vs), breaks = (idx + brk)/2) +
+  ylab('Emmean') +
+  theme_bw() +
+  ggtitle('log-OGU Rich. emmeans') +
+  theme(plot.title = element_text(size=11)) +
+  theme(legend.title = element_text(size=11)) +
+
+  theme(legend.position = 'bottom'
+      , legend.title.position = 'top'
+      , panel.grid = element_blank()) +
+  theme(panel.spacing = unit(0, 'lines')) +
+  theme(axis.text.y = element_text(angle = 0, hjust = 0, vjust = 0.5)
+      , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+## Change facet label colors
+pdf(file = NULL)
+g = ggplot_gtable(ggplot_build(sero_emm_plot))
+dev.off()
+stripr <- which(grepl('strip-t', g$layout$name))
+fills <- col_pal_country_light
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k = k+1
+}
+
+sero_emm_plot2 = g
+
+plot(sero_emm_plot2)
+
+
+
+```
+
+## Beta diversity bubbleplots
+```{r, fig.width = 4, fig.height = 10.5}
+library('cowplot')
+library('vegan')
+library('ggpubr')
+library('khroma')
+
+bubbleplot_betadivs_v = function(adolist)
+{
+    relabelx = setNames(
+    c('Age', 'Delivery','FORM/MOM', 'Secretor', 'Solids', 'Inf. BW', 'Inf. GA', 'Country','Inf. Sex','Seroconv') %>% factor(levels = c('Seroconv', 'Country', 'Age', 'Inf. Sex', 'Delivery','Inf. BW','Inf. GA', 'FORM/MOM','Solids', 'Secretor') %>% rev())
+    ,
+    c('age', 'delivery', 'formula_bm','Secretor','solid_food_introduced','inf_birth_weight','gest_age','country','sex','Seroconverted')
+)
+    boxwh = 0.85
+    timepoints = md[,visit] %>% unique()
+    timepointdt = timepoints %>% lapply(
+    function(x) 
+    {
+        z = adolist[[x]][[1]] %>% as.data.table(keep.rownames = TRUE)
+        z[, timepoint := x]
+    }
+    ) %>% do.call('rbind', .)
+
+    
+    timepointdt = timepointdt[! (rn %in% c('Residual', 'Total')), ]
+    colnames(timepointdt) = make.names(colnames(timepointdt))
+    
+    timepointdt[,timepoint := relabely[as.character(timepoint)]]
+    timepointdt[,rn := relabelx[as.character(rn)]]
+    
+    ## Convert infinite F-values to zero
+    timepointdt[is.na(Pr..F.), F := 0]
+    ## Get negative log pval.
+    timepointdt[,neglogpval := -log10(Pr..F.)]
+    ## Significant entries are those with pvalue < 0.05
+    timepointdt[, significant := Pr..F. < 0.05]
+
+    ggplot(timepointdt, aes(x = timepoint, y = rn)) +
+        
+        
+        geom_point(data = timepointdt[!is.na(significant),]
+                 , aes(size = R2, color = R2)) +
+        scale_colour_gradientn(colours = color("YlOrBr")(9)
+                              , limits = c(0, 0.04)
+                              , breaks = 1:4*(1/100)
+                              #, (labels = 1:4*(1/100)) %>% as.character()
+                              , guide = 'legend') +
+        
+        scale_size_continuous(range = c(0, 8)
+                          , limits = c(0, 0.04)
+                          , breaks = 1:4*(1/100)
+                          #, labels = (1:4*(1/100)) %>% as.character()
+                          , guide = 'legend') +
+        ## background boxes
+        geom_tile(data = timepointdt
+                , color = col_pal_signif['n.s.']
+                , size = 1.25, width=1, height=1
+                , fill = NA) +
+        
+        ## NAs; invariant boxes
+        geom_tile(data = timepointdt[is.na(significant),]
+                , color = col_pal_signif['n.s.']
+                , size = 1.25, width=boxwh, height=boxwh
+                , fill = col_pal_signif_pale['n.s.']) +
+        
+        ## Nonsignificant, non invariant
+        geom_tile(data = timepointdt[Pr..F. >= 0.1 ,]
+                , color = col_pal_signif['n.s.']
+                , size = 1.25, width=boxwh, height=boxwh
+                , fill = NA) +
+        
+        ## Significant at 0.1
+        geom_tile(data = timepointdt[Pr..F. < 0.1,]
+                , color = col_pal_signif['.']
+                , size = 1.25, width=boxwh, height=boxwh
+                , fill = NA) +
+        
+        ## Significant at 0.05
+        geom_tile(data = timepointdt[Pr..F. < 0.05,]
+                , color = col_pal_signif['*']
+                , size = 1.25, width=boxwh, height=boxwh
+                , fill = NA) +
+        
+        scale_x_discrete(expand = c(0,0)) +
+        scale_y_discrete(expand = c(0,0)) +
+        coord_equal(ratio = 1) +
+        theme_bw() +
+        theme(plot.title = element_text(size=11)) +
+        theme(
+            axis.title.x = element_blank()
+          , axis.title.y = element_blank()
+          , panel.grid = element_blank()
+          , panel.border = element_blank() #element_rect(linewidth = 1.5)
+          , legend.position = 'none'
+          , axis.ticks = element_blank()
+          , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+        )
+}
+
+
+bubbleplot_betadivs_h = function(adolist)
+{
+    relabelx = setNames(
+    c('Age', 'Delivery','FORM/MOM', 'Secretor', 'Solids', 'Inf. BW', 'Inf. GA', 'Country','Inf. Sex','Seroconv') %>% factor(levels = c('Seroconv', 'Country', 'Age', 'Inf. Sex', 'Delivery','Inf. BW','Inf. GA', 'FORM/MOM','Solids', 'Secretor') %>% rev())
+    ,
+    c('age', 'delivery', 'formula_bm','Secretor','solid_food_introduced','inf_birth_weight','gest_age','country','sex','Seroconverted')
+)
+    boxwh = 0.85
+    timepoints = md[,visit] %>% unique()
+    timepointdt = timepoints %>% lapply(
+    function(x) 
+    {
+        z = adolist[[x]][[1]] %>% as.data.table(keep.rownames = TRUE)
+        z[, timepoint := x]
+    }
+    ) %>% do.call('rbind', .)
+
+    
+    timepointdt = timepointdt[! (rn %in% c('Residual', 'Total')), ]
+    colnames(timepointdt) = make.names(colnames(timepointdt))
+    
+    timepointdt[,timepoint := relabely[as.character(timepoint)]]
+    timepointdt[,rn := relabelx[as.character(rn)]]
+    
+    ## Convert infinite F-values to zero
+    timepointdt[is.na(Pr..F.), F := 0]
+    ## Get negative log pval.
+    timepointdt[,neglogpval := -log10(Pr..F.)]
+    ## Significant entries are those with pvalue < 0.05
+    timepointdt[, significant := Pr..F. < 0.05]
+
+    ggplot(timepointdt, aes(y = timepoint, x = rn)) +
+        
+        
+        geom_point(data = timepointdt[!is.na(significant),]
+                 , aes(size = R2, color = R2)) +
+        scale_colour_gradientn(colours = color("YlOrBr")(9)
+                              , limits = c(0, 0.04)
+                              , breaks = 1:4*(1/100)
+                              #, (labels = 1:4*(1/100)) %>% as.character()
+                              , guide = 'legend') +
+        
+        scale_size_continuous(range = c(0, 8)
+                          , limits = c(0, 0.04)
+                          , breaks = 1:4*(1/100)
+                          #, labels = (1:4*(1/100)) %>% as.character()
+                          , guide = 'legend') +
+        ## background boxes
+        geom_tile(data = timepointdt
+                , color = col_pal_signif['n.s.']
+                , size = 1.25, width=1, height=1
+                , fill = NA) +
+        
+        ## NAs; invariant boxes
+        geom_tile(data = timepointdt[is.na(significant),]
+                , color = col_pal_signif['n.s.']
+                , size = 1.25, width=boxwh, height=boxwh
+                , fill = col_pal_signif_pale['n.s.']) +
+        
+        ## Nonsignificant, non invariant
+        geom_tile(data = timepointdt[Pr..F. >= 0.1 ,]
+                , color = col_pal_signif['n.s.']
+                , size = 1.25, width=boxwh, height=boxwh
+                , fill = NA) +
+        
+        ## Significant at 0.1
+        geom_tile(data = timepointdt[Pr..F. < 0.1,]
+                , color = col_pal_signif['.']
+                , size = 1.25, width=boxwh, height=boxwh
+                , fill = NA) +
+        
+        ## Significant at 0.05
+        geom_tile(data = timepointdt[Pr..F. < 0.05,]
+                , color = col_pal_signif['*']
+                , size = 1.25, width=boxwh, height=boxwh
+                , fill = NA) +
+        
+        scale_x_discrete(expand = c(0,0)) +
+        scale_y_discrete(expand = c(0,0)) +
+        coord_equal(ratio = 1) +
+        theme_bw() +
+        theme(plot.title = element_text(size=11)) +
+        theme(
+            axis.title.x = element_blank()
+          , axis.title.y = element_blank()
+          , panel.grid = element_blank()
+          , panel.border = element_blank() #element_rect(linewidth = 1.5)
+          , legend.position = 'none'
+          , axis.ticks = element_blank()
+          , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+        )
+}
+
+## Define the range of F-stats that we're going to see
+range_R2s = lapply(c(br_adonis_list, eu_adonis_list, wu_adonis_list, uwu_adonis_list), function(x) x[[1]] %>% as.data.table()) %>% do.call('rbind',.) %>% na.omit() %>% dplyr::select(R2)
+
+#x_min_range = c(0, max(range_Fs))
+F_breaks = c(1.5, 4.5, 7.5)
+
+## Bray
+bubbleplot_bray = bubbleplot_betadivs_h(br_adonis_list) + ggtitle('Bray-Curtis') +
+    theme(axis.text.y = element_text(angle = 0, hjust = 0, vjust = 0.5)
+        , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+## Aitchison
+bubbleplot_aitchison = bubbleplot_betadivs_h(eu_adonis_list) + ggtitle('Aitchison') +
+    theme(axis.text.y = element_text(angle = 0, hjust = 0, vjust = 0.5)
+        , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+## Weighted unifrac
+bubbleplot_uwu = bubbleplot_betadivs_h(wu_adonis_list) + ggtitle('W-UniFrac') +
+    theme(axis.text.y = element_text(angle = 0, hjust = 0, vjust = 0.5)
+        , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+## Unweighted unifrac
+bubbleplot_wu = bubbleplot_betadivs_h(uwu_adonis_list) + ggtitle('UW-UniFrac') +
+    theme(axis.text.y = element_text(angle = 0, hjust = 0, vjust = 0.5)
+        , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+## Legend
+pdf(file = NULL)
+    pl = ggpubr::get_legend(bubbleplot_bray + theme(legend.position = 'bottom'))
+dev.off()
+
+beta_bubbleplots = plot_grid(bubbleplot_bray
+        , bubbleplot_aitchison
+        , bubbleplot_uwu
+        , bubbleplot_wu
+        , pl
+        , labels = c('A','B','C','D'), ncol = 1)
+
+plot(beta_bubbleplots)
+
+svglite('figures/extended-data-betadiv-bubbleplots.svg', width = 6, height = 10, fix_text_size = FALSE)
+    plot(beta_bubbleplots)
+dev.off()
+```
+
+## Beta diversity ordinations, cross-sectional
+```{r, fig.width = 5, fig.height = 7.5}
+
+## Beta diversity ordinations
+plot_country_seroconversion_ords = function(x) 
+{
+    ord_data =  x[[2]]$data
+    permanova = x[[1]] %>% as.data.table(keep.rownames = TRUE)
+    
+    ord_data[,sero.centroid.Axis.1 := median(Axis.1), by = .(Seroconverted)]
+    ord_data[,sero.centroid.Axis.2 := median(Axis.2), by = .(Seroconverted)]
+    ord_data[,country.centroid.Axis.1 := median(Axis.1), by = .(country)]
+    ord_data[,country.centroid.Axis.2 := median(Axis.2), by = .(country)]
+    
+    ## Background ellipses
+    p1 = ggplot(data = ord_data) +
+        stat_ellipse(mapping = aes(fill = country, x = Axis.1, y = Axis.2), geom = "polygon", alpha = 0.15)
+        
+    ## Add spiders
+    #for(co in ord_data[,country] %>% unique()) p1 = p1 +
+    #    geom_segment(data = ord_data[country == co,]
+    #               , mapping = aes(
+    #                   x = Axis.1, xend = country.centroid.Axis.1
+    #                 , y = Axis.2, yend = country.centroid.Axis.2
+    #                 , color = country)
+    #               , alpha = 0.25
+    #               , size = 0.65)
+    
+    ## Add in points
+    p1 = p1 + geom_point(mapping = aes(
+                   x = Axis.1
+                 , y = Axis.2
+                 , color = country)
+                 , size = 0.8)
+    
+    ## Centroids
+    for(co in ord_data[,country] %>% unique()) p1 = p1 +
+        geom_point(data = ord_data[country == co,][!duplicated(country),]
+                 , mapping = aes(
+                     x = country.centroid.Axis.1
+                   , y = country.centroid.Axis.2
+                   , fill = country)
+                 , color = neutral_gray
+                 , size = 2.5
+                 , shape = 21)
+    
+    ## Build pvals.
+    p.value = permanova[rn == 'country', `Pr(>F)`]
+    f.stat = permanova[rn == 'country', `F`] %>% round(3)
+    pval = ifelse(p.value < 0.01, '<0.01', paste0('= ', as.character(signif(p.value, digits=3))))
+    plabs =  paste0('P ', pval, '\nF = ', f.stat)
+    
+    ## annotate
+    p1 = p1 + annotate(geom = 'text'
+                 , x = ord_data[,(min(Axis.1) %>% abs())] * ord_data[,min(Axis.1) %>% sign()]*1.2
+                 , y = ord_data[,(max(Axis.2) %>% abs())] * ord_data[,max(Axis.2) %>% sign()]*1.1
+                 , label = plabs
+                 , hjust = 0, vjust = 1
+                 , lineheight = 0.95
+                 , color = neutral_gray)
+
+    ## Theme elements
+    p1 = p1 +
+        scale_color_country_outer +
+        scale_fill_country_outer +
+        facet_grid(~relabely[visit]) +
+        
+        xlab('Axis1') +
+        ylab('Axis2') +
+        theme_bw() +
+        theme(plot.title = element_text(size=11)) +
+        theme(legend.position = 'none', panel.grid = element_blank())
+    
+    ## Change facet label colors
+    pdf(file = NULL)
+    g = ggplot_gtable(ggplot_build(p1))
+    dev.off()
+    stripr <- which(grepl('strip-t', g$layout$name))
+    fills <- col_pal_visit_light[intersect(names(col_pal_visit_light), ord_data[,visit])]
+    
+    k = 1
+    for (i in stripr) {
+      j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+      g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+      k = k+1
+    }
+    
+    pl1 = ggplotify::as.ggplot(g)
+
+    ## By seroconversion
+    
+    ## Background ellipses
+    p2 = ggplot(data = ord_data) +
+        stat_ellipse(mapping = aes(fill = Seroconverted, x = Axis.1, y = Axis.2), geom = "polygon", alpha = 0.15)
+        
+    ## Add spiders
+    #for(sc in ord_data[,Seroconverted] %>% unique()) p2 = p2 +
+    #    geom_segment(data = ord_data[Seroconverted == sc,]
+    #               , mapping = aes(
+    #                   x = Axis.1, xend = sero.centroid.Axis.1
+    #                 , y = Axis.2, yend = sero.centroid.Axis.2
+    #                 , color = Seroconverted)
+    #               , alpha = 0.25
+    #               , size = 0.65)
+    ## Add in points
+    p2 = p2 + geom_point(mapping = aes(
+                   x = Axis.1
+                 , y = Axis.2
+                 , color = Seroconverted)
+                 , size = 0.8)
+    
+    ## Centroids
+    for(sc in ord_data[,Seroconverted] %>% unique()) p2 = p2 +
+                
+        geom_point(data = ord_data[Seroconverted == sc,][!duplicated(Seroconverted),]
+                 , mapping = aes(
+                     x = sero.centroid.Axis.1
+                   , y = sero.centroid.Axis.2
+                   , fill = Seroconverted)
+                 , color = neutral_gray
+                 , size = 2.5
+                 , shape = 21)
+    
+    ## Build pvals.
+    p.value = permanova[rn == 'Seroconverted', `Pr(>F)`]
+    f.stat = permanova[rn == 'Seroconverted', `F`] %>% round(3)
+    pval = ifelse(p.value < 0.01, '<0.01', paste0('= ', as.character(signif(p.value, digits=3))))
+    plabs =  paste0('P ', pval, '\nF = ', f.stat)
+    
+    p2 = p2 + annotate(geom = 'text'
+                     , x = ord_data[,(min(Axis.1) %>% abs())] * ord_data[,min(Axis.1) %>% sign()]*1.2
+                     , y = ord_data[,(max(Axis.2) %>% abs())] * ord_data[,max(Axis.2) %>% sign()]*1.1
+                     , label = plabs
+                     , hjust = 0, vjust = 1
+                     , lineheight = 0.95
+                     , color = neutral_gray)
+
+    p2 = p2 +
+        scale_color_sero_outer +
+        scale_fill_sero_outer +
+        facet_grid(~relabely[visit]) +
+        
+        xlab('Axis1') +
+        ylab('Axis2') +
+        theme_bw() +
+        theme(plot.title = element_text(size=11)) +
+        theme(legend.position = 'none', panel.grid = element_blank())
+    
+    ## Change facet label colors
+    pdf(file = NULL)
+    g = ggplot_gtable(ggplot_build(p2))
+    dev.off()
+    stripr <- which(grepl('strip-t', g$layout$name))
+    fills <- col_pal_visit_light[intersect(names(col_pal_visit_light), ord_data[,visit])]
+    
+    k = 1
+    for (i in stripr) {
+      j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+      g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+      k = k+1
+    }
+    
+    pl2 = ggplotify::as.ggplot(g)
+    
+    list(pl1, pl2)
+    
+}
+
+## get data from ordination
+aitchison_ordplots = lapply(eu_adonis_list, plot_country_seroconversion_ords) %>% do.call('c',.)
+bray_ordplots = lapply(br_adonis_list, plot_country_seroconversion_ords) %>% do.call('c',.)
+wu_ordplots = lapply(uwu_adonis_list, plot_country_seroconversion_ords) %>% do.call('c',.)
+uwu_ordplots = lapply(wu_adonis_list, plot_country_seroconversion_ords) %>% do.call('c',.)
+
+## All ordination plots
+aitchison_plotgrid = plot_grid(plotlist = aitchison_ordplots, ncol = 2, nrow = 3)
+bray_plotgrid = plot_grid(plotlist = bray_ordplots, ncol = 2, nrow = 3)
+wu_plotgrid = plot_grid(plotlist = wu_ordplots, ncol = 2, nrow = 3)
+uwu_plotgrid = plot_grid(plotlist = uwu_ordplots, ncol = 2, nrow = 3)
+
+```
+
+## Beta diversity ordinations, cross-sectional acPCoA (for aitchison only)
+```{r, fig.width = 2.5, fig.height = 2.5}
+## late revision: we don't want to use regular PCoA because our conclusion is
+## about the data being highly confounded. Instead, we'll use acPCoA to get the
+## point across to the reader.
+library('caret')
+silence(
+{
+    list.files('include/acPCoA/R/', pattern = '.R') %>%
+        paste0('include/acPCoA/R/',.) %>%
+        sapply(source)
+})
+
+set.seed(123) ## re-set the seed; I'm generating figures from blocks.
+aitchison_acpcoa = lapply(1:length(eu_adonis_list),
+function(i)
+{
+    dats = eu_adonis_list[[i]][[2]]$data
+    ## get dm
+    dm = eu_adonis_list[[i]][[3]]
+    
+    ## Dummy vars.
+    confounders = dats[,.(country, delivery, formula_bm)] %>%
+        dummyVars(data = ., formula = "~.") %>%
+        predict(newdata=dats[,.(country, delivery, formula_bm)]) %>%
+    cbind(dats[,.(age)])
+    
+    ## Fix the encoding of formula
+    confounders[formula_bmBOTH == 1,formula_bmMOM := 1]
+    confounders[formula_bmBOTH == 1,formula_bmFORMULA := 1]
+    
+    ## Remove redundant cols
+    confounders[,formula_bmBOTH := NULL]
+    confounders[,countryPanama := NULL]
+    confounders[,deliveryvaginal := NULL]
+    
+    ## Run acPCoA.
+    result_acPCoA = acPCoA(DistanceMatrix=dm
+                         , ConfounderMatrix=confounders %>% as.matrix() %>% scale()
+                         , nPC=2
+                         , lambda=seq(0, 20, 0.05)
+                         , kernel="linear"
+                         , anov = F)
+    
+    ord_data = result_acPCoA$Xv %>% cbind(dats)
+    
+    ## vs. acpcoa
+    message(i)
+    message('vs acpcoa')
+    glm(data = ord_data, factor(Seroconverted) ~ V1 + V2, family = 'binomial') %>% summary() %>% print()
+    glm(data = ord_data, log(pre_rota_sero_iga) ~ V1 + V2, family = 'gaussian') %>% summary() %>% print()
+    
+    glm(data = ord_data, log(post_rota_sero_iga) ~ log(pre_rota_sero_iga) + V1 + V2, family = 'gaussian') %>% summary() %>% print()
+        
+    ## vs. pcoa
+    message('vs pcoa')
+    glm(data = ord_data, factor(Seroconverted) ~ Axis.1 + Axis.2, family = 'binomial') %>% summary() %>% print()
+    
+    glm(data = ord_data, log(pre_rota_sero_iga) ~ Axis.1 + Axis.2, family = 'gaussian') %>% summary() %>% print()
+    
+    glm(data = ord_data, log(post_rota_sero_iga) ~ log(pre_rota_sero_iga) + Axis.1 + Axis.2, family = 'gaussian') %>% summary() %>% print()
+  
+    ord_data[,sero.centroid.Axis.1 := median(V1), by = .(Seroconverted)]
+    ord_data[,sero.centroid.Axis.2 := median(V2), by = .(Seroconverted)]
+     
+    permanova = eu_adonis_list[[i]][[1]] %>% as.data.table(keep.rownames = TRUE)
+    ## Background ellipses
+    p2 = ggplot(data = ord_data) +
+        stat_ellipse(mapping = aes(fill = Seroconverted, x = V1, y = V2), geom = "polygon", alpha = 0.15)
+        
+    ## Add in points
+    p2 = p2 + geom_point(mapping = aes(
+                   x = V1
+                 , y = V2
+                 , color = Seroconverted)
+                 , size = 0.8)
+    
+    ## Centroids
+    for(sc in ord_data[,Seroconverted] %>% unique()) p2 = p2 +
+                
+        geom_point(data = ord_data[Seroconverted == sc,][!duplicated(Seroconverted),]
+                 , mapping = aes(
+                     x = sero.centroid.Axis.1
+                   , y = sero.centroid.Axis.2
+                   , fill = Seroconverted)
+                 , color = neutral_gray
+                 , size = 2.5
+                 , shape = 21)
+    
+    ## Build pvals.
+    p.value = permanova[rn == 'Seroconverted', `Pr(>F)`]
+    f.stat = permanova[rn == 'Seroconverted', `F`] %>% round(3)
+    pval = ifelse(p.value < 0.01, '<0.01', paste0('= ', as.character(signif(p.value, digits=3))))
+    plabs =  paste0('P ', pval, '\nF = ', f.stat)
+    
+    p2 = p2 + annotate(geom = 'text'
+                     , x = ord_data[,(min(V1) %>% abs())] * ord_data[,min(V1) %>% sign()]*1.2
+                     , y = ord_data[,(max(V2) %>% abs())] * ord_data[,max(V2) %>% sign()]*1.1
+                     , label = plabs
+                     , hjust = 0, vjust = 1
+                     , lineheight = 0.95
+                     , color = neutral_gray)
+
+    p2 = p2 +
+        scale_color_sero_outer +
+        scale_fill_sero_outer +
+        facet_grid(~relabely[visit]) +
+        
+        xlab('Axis1') +
+        ylab('Axis2') +
+        theme_bw() +
+        theme(plot.title = element_text(size=11)) +
+        theme(legend.position = 'none', panel.grid = element_blank())
+    
+    ## Change facet label colors
+    pdf(file = NULL)
+    g = ggplot_gtable(ggplot_build(p2))
+    dev.off()
+    stripr <- which(grepl('strip-t', g$layout$name))
+    fills <- col_pal_visit_light[intersect(names(col_pal_visit_light), ord_data[,visit])]
+    
+    k = 1
+    for (i in stripr) {
+      j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+      g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+      k = k+1
+    }
+    
+    pl2 = ggplotify::as.ggplot(g)
+    
+    return(list(pl2, ord_data))
+})
+```
+
+## Alpha diversity boxplots
+```{r, fig.width = 3, fig.height = 3}
+## Custom axis defs
+vs = alphadivdata[,visit] %>% unique()
+vl = length(vs)
+
+axl  = rep(relabely, 2) %>% sort()
+
+## identify breaks by finding duped labels, from both directions (removing ends)
+idx = axl %>% rev() %>% duplicated() %>% not() %>% rev() %>% which()
+brk = axl %>% duplicated() %>% not() %>% which()
+
+## grab intersect and subtract half
+sep = data.frame(sep = intersect(idx + 1, brk) - 0.5)
+
+pab = ggplot(alphadivnona[!is.na(Seroconverted),]) +
+    geom_boxplot(aes(y = log10(SR)
+                   , x = paste0(visit, abbreviate.response(Seroconverted)) %>%
+                               factor() %>%
+                               as.numeric()
+                   , group = interaction(visit, abbreviate.response(Seroconverted))
+                   , fill = Seroconverted
+                   , color = Seroconverted)
+                 , outlier.shape = NA) +
+        
+
+    
+    geom_beeswarm(aes(y = log10(SR)
+                  , x = paste0(visit, abbreviate.response(Seroconverted)) %>%
+                               factor() %>%
+                               as.numeric()
+                  , color = factor(Seroconverted)
+                  )
+                , size = 0.75
+                , dodge.width = 0.5
+                ) +
+    
+    scale_color_sero_outer +
+    scale_fill_sero_pale +
+    
+        #geom_hline(yintercept = log2(20), linetype = 'dashed', color = neutral_gray) +
+    geom_segment(data = sep
+                 , aes(x = sep, xend = sep), y = 1.9, yend = 2.5, color = neutral_gray) +
+    geom_segment(data = sep
+                 , aes(x = sep, xend = sep), y = 1.8, yend = 2.6, color = neutral_gray
+                 , linetype = 'dashed') +
+    xlab('') +
+    scale_x_continuous(labels = relabely[vs], breaks = (idx + brk)/2) +
+    
+    #facet_grid(relabely[visit]~country) +
+    facet_grid(~country) +
+
+    xlab('') +
+    ylab('log10(OGU Richness)') +
+    theme_bw() +
+    theme(plot.title = element_text(size=11)) +
+    theme(legend.position = 'bottom', legend.title.position = 'top'
+                 , panel.grid = element_blank()) +
+    theme(axis.text.y = element_text(angle = 0, hjust = 0, vjust = 0.5)
+        , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+## Change facet label colors
+pdf(file = NULL)
+g = ggplot_gtable(ggplot_build(pab))
+dev.off()
+stripr <- which(grepl('strip-t', g$layout$name))
+fills <- col_pal_country_light
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k = k+1
+}
+
+stripr <- which(grepl('strip-r', g$layout$name))
+fills <- col_pal_visit_light
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k = k+1
+}
+
+alpha_boxplots_country_all = g
+
+## just NB now
+pab = ggplot(alphadivnona[visit == 'NB' & !is.na(Seroconverted),]) +
+    geom_boxplot(aes(y = log10(SR)
+                   , x = interaction(visit, abbreviate.response(Seroconverted))
+                   , fill = Seroconverted
+                   , color = Seroconverted)
+                 , outlier.shape = NA) +
+        
+
+    
+    geom_beeswarm(aes(y = log10(SR)
+                  , x = interaction(visit, abbreviate.response(Seroconverted))
+                  , color = factor(Seroconverted)
+                  )
+                , size = 0.75
+                , dodge.width = 0.5
+                ) +
+    
+    scale_color_sero_outer +
+    scale_fill_sero_pale +
+    
+    #facet_grid(relabely[visit]~country) +
+    facet_grid(~country) +
+
+    xlab('') +
+    ylab('log10(OGU Richness)') +
+    theme_bw() +
+    theme(plot.title = element_text(size=11)) +
+    theme(legend.position = 'bottom', legend.title.position = 'top'
+                     , panel.grid = element_blank()) +
+    theme(axis.text.y = element_text(angle = 0, hjust = 0, vjust = 0.5)
+        , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+## Change facet label colors
+pdf(file = NULL)
+g = ggplot_gtable(ggplot_build(pab))
+dev.off()
+stripr <- which(grepl('strip-t', g$layout$name))
+fills <- col_pal_country_light
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k = k+1
+}
+
+#stripr <- which(grepl('strip-r', g$layout$name))
+#fills <- col_pal_visit_light['NB']
+
+#k = 1
+#for (i in stripr) {
+#  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+#  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+#  k = k+1
+#}
+
+alpha_boxplots_country_NB = g
+
+plot(alpha_boxplots_country_NB)
+plot(alpha_boxplots_country_all)
+```
+
+## Alpha diversity bubbleplots
+```{r, fig.width = 4, fig.height = 4.5}
+## Alpha divs
+boxwh = 0.85
+
+relabelx = setNames(
+    c('Visit', 'Delivery','FORM/MOM', 'Secretor', 'Solids', 'Inf. BW', 'Abx', 'Inf. GA', 'Country','Inf. Sex','Seroconv') %>% factor(levels = c('Seroconv', 'Country', 'Visit', 'Inf. Sex', 'Delivery','Inf. BW', 'Abx', 'Inf. GA', 'FORM/MOM','Solids', 'Secretor') %>% rev())
+        ,
+    c('visit', 'delivery', 'formula_bm','Secretor','solid_food_introduced','inf_birth_weight','abx_status', 'gest_age','country','sex','Seroconverted')
+)
+    
+alpha_signifdt = list(
+      SR_signifdt[,.(variable = rn, Fval = `F`, pval = `Pr(>F)`, metric = 'Richness')]
+    , EMR_signifdt[,.(variable = rn, Fval = `F`, pval = `Pr(>F)`, metric = 'EMR')]
+    , PD_signifdt[,.(variable = rn, Fval = `F`, pval = `Pr(>F)`, metric = 'PD')]
+    , shannon_signifdt[,.(variable = rn, Fval = `F`, pval = `Pr(>F)`, metric = 'shannon')]
+    , simpson_signifdt[,.(variable = rn, Fval = `F`, pval = `Pr(>F)`, metric = 'simpson')]
+) %>% do.call('rbind', .)
+
+alpha_signifdt = alpha_signifdt[variable != '(Intercept)',]
+alpha_signifdt[, significant := pval < 0.05]
+
+alpha_signifdt[,variable := relabelx[as.character(variable)]]
+    
+alpha_bubbleplot = ggplot(alpha_signifdt, aes(y = metric, x = variable)) +
+        
+    geom_point(data = alpha_signifdt[!is.na(significant),]
+                 , aes(size = Fval, color = Fval)) +
+    scale_colour_gradientn(colours = color("YlOrBr")(9)
+                              , limits = c(0, 10)
+                              , breaks = 1:4 * (2.5)
+                              #, (labels = 1:4*(1/100)) %>% as.character()
+                              , guide = 'legend') +
+        
+    scale_size_continuous(range = c(0, 8)
+                          , limits = c(0, 10)
+                          , breaks = 1:4 * (2.5)
+                          #, labels = (1:4*(1/100)) %>% as.character()
+                          , guide = 'legend') +
+    ## background boxes
+    geom_tile(data = alpha_signifdt
+            , color = col_pal_signif_pale['n.s.']
+            , size = 1.25, width=1, height=1
+            , fill = NA) +
+    
+    ## NAs; invariant boxes
+    geom_tile(data = alpha_signifdt[is.na(significant),]
+            , color = col_pal_signif['n.s.']
+            , size = 1.25, width=boxwh, height=boxwh
+            , fill = col_pal_signif_pale['n.s.']) +
+    
+    ## Nonsignificant, non invariant
+    geom_tile(data = alpha_signifdt[pval >= 0.1 ,]
+            , color = col_pal_signif['n.s.']
+            , size = 1.25, width=boxwh, height=boxwh
+            , fill = NA) +
+    
+    ## Significant at 0.1
+    geom_tile(data = alpha_signifdt[pval < 0.1,]
+            , color = col_pal_signif['.']
+            , size = 1.25, width=boxwh, height=boxwh
+            , fill = NA) +
+    
+    ## Significant at 0.05
+    geom_tile(data = alpha_signifdt[pval < 0.05,]
+            , color = col_pal_signif['*']
+            , size = 1.25, width=boxwh, height=boxwh
+            , fill = NA) +
+    
+    scale_x_discrete(expand = c(0,0)) +
+    scale_y_discrete(expand = c(0,0)) +
+    coord_equal(ratio = 1) +
+    theme_bw() +
+    theme(plot.title = element_text(size=11)) +
+    theme(
+        axis.title.x = element_blank()
+      , axis.title.y = element_blank()
+      , panel.grid = element_blank()
+      , panel.border = element_blank() #element_rect(linewidth = 1.5)
+      , legend.position = 'right'
+      , axis.ticks = element_blank()
+      , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+    )
+
+plot(alpha_bubbleplot)
+
+```
+
+## Render figure 2
+```{r, fig.width = 8.5, fig.height = 8.5, eval = FALSE}
+
+r1c1 = plot_grid(sero_emm_plot2, '', nrow = 2, rel_heights =c(1, 0.3))
+
+r1 = plot_grid(r1c1, alpha_bubbleplot + ggtitle('Alpha diversity LMEM')
+               , ncol = 2, labels = c('A','B')
+               , rel_widths = c(0.5, 1))
+
+r1 = plot_grid(r1, '', rel_widths = c(6.5, 2), ncol = 2)
+
+#r1c2 = plot_grid(plotlist = aitchison_ordplots, labels = c('C','','','','',''), ncol = 2)
+pp = plot_grid(plotlist=lapply(aitchison_acpcoa, function(x) x[[1]]), ncol = 3) 
+r2c1 = plot_grid(allv_ords_visit + theme(legend.position ='none'), labels = c('C'))
+
+r2c2 = plot_grid(pp
+               , bubbleplot_aitchison +
+                   theme(legend.title =element_text(size=11), legend.position = 'left') +
+                   ggtitle('Aitchison PERMANOVA')
+               , labels = c('D','E'), nrow = 2)
+
+r2 = plot_grid(r2c1, r2c2, ncol = 2, rel_widths = c(1, 2.5))
+
+fig2 = plot_grid(r1, r2, nrow = 2, rel_heights = c(2.5, 2.5))
+
+plot(fig2)
+
+svglite('figures/figure2-bad.svg', width = 8.5, height = 8.5, fix_text_size = FALSE)
+    plot(fig2)
+dev.off()
+
+## Write source data to files.
+
+## Alpha divs
+fwrite(alpha_signifdt, 'source-data/fig2/alpha-diversity-terms.txt.xls', sep='\t') ## bubbleplots
+
+fwrite(alphadivnona[,.(Seroconverted, country, visit, enrollment_id, SR, EMR, PD, shannon, simpson)], 'source-data/fig2/alpha-diversity.txt.xls', sep='\t') ## raw alpha divs (boxplots)
+
+fwrite(sero_emm_df, 'source-data/fig2/alpha-div-emmeans.txt.xls',sep='\t') ## alpha emmeans
+
+## aitchison
+fwrite(ord_data[,.(Seroconverted, country, visit, enrollment_id, Axis.1, Axis.2)], 'source-data/fig2/aitchison-pcoa.txt.xls', sep='\t')
+
+## cross sectional aitchison
+rbind(aitchison_acpcoa[[1]][[2]][,.(Seroconverted, country, visit, enrollment_id, V1, V2)],
+      aitchison_acpcoa[[2]][[2]][,.(Seroconverted, country, visit, enrollment_id, V1, V2)],
+      aitchison_acpcoa[[3]][[2]][,.(Seroconverted, country, visit, enrollment_id, V1, V2)]) %>%
+
+fwrite(., 'source-data/fig2/cross-sectional-aitchison-pcoa.txt.xls', sep='\t')
+
+## Aitchison adonis2 bubbledata.
+visits %>% lapply(
+    function(x) 
+    {
+        z = eu_adonis_list[[x]][[1]] %>% as.data.table(keep.rownames = TRUE)
+        z[, timepoint := x]
+    }
+    ) %>% do.call('rbind', .) %>%
+
+fwrite(., 'source-data/fig2/aitchison-adonis2.txt.xls', sep='\t')
+```
+
+
+# Figure 3: Differential abundance
+```{r}
+library('cowplot')
+library('vegan')
+library('ggpubr')
+library('khroma')
+
+load('diffabund.RData')
+load('beta-div.RData')
+```
+
+## dbRDA: boxplot & feature scores
+```{r, fig.width = 6, fig.height = 2.5}
+## Grab ordination data
+ord_coords = dbrda_alr$CCA$wa
+ord_data =  ord_coords %>% cbind(filtered_metadata[rownames(ord_coords),])
+ord_data[,sero.centroid.dbRDA1 := median(dbRDA1), by = .(Seroconverted)]
+ord_data[,sero.centroid.pre_iga := median(log2(pre_rota_sero_iga)), by = .(Seroconverted)]
+ord_data[,sero.centroid.post_iga := median(log2(post_rota_sero_iga)), by = .(Seroconverted)]
+
+ord_bp_data = ord_data[,.(dbRDA1, visit = 'Month 2', Seroconverted, country, val = log2(pre_rota_sero_iga))] %>%
+        rbind(ord_data[,.(dbRDA1, visit = 'Month 6', Seroconverted, country, val = log2(post_rota_sero_iga))])# %>%
+        #rbind(ord_data[,.(dbRDA1, visit = 'Foldchange', country, val = log2(rota_sero_iga_fc))])
+
+g = ggplot(ord_data) +
+
+    geom_boxplot(aes(y = dbRDA1
+                   , x = abbreviate.response(Seroconverted)
+                   , fill = Seroconverted
+                   , color = Seroconverted
+                 )
+                 , outlier.shape = NA) +
+    
+    scale_color_sero_outer +
+    scale_fill_sero_pale +
+    
+    geom_beeswarm(aes(y = dbRDA1
+                  , x = abbreviate.response(Seroconverted)
+                  , color = factor(Seroconverted)
+                  )
+                , size = 0.75
+                , dodge.width = 0.5
+                ) +
+    
+
+    facet_grid(relabely[visit]~country) +
+    xlab('') +
+    xlim(abbreviate.response(rev(names(col_pal_sero_dark)))) + 
+    ylab('dbRDA1') +
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) + 
+    theme(legend.position = 'bottom', legend.title.position = 'top', panel.grid = element_blank())
+
+
+## Change facet label colors
+pdf(file = NULL)
+g = ggplot_gtable(ggplot_build(g))
+dev.off()
+
+stripr <- which(grepl('strip-t', g$layout$name))
+fills <- col_pal_country_light
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k = k+1
+}
+
+
+stripr <- which(grepl('strip-r', g$layout$name))
+fills <- col_pal_visit_light[intersect(names(col_pal_visit_light), ord_data[,visit])]
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k = k+1
+}
+
+dbrda_sero_jitterbox = g
+
+## species contributions
+dbrda_spp_data = sppscores[order(percent) %>% rev(),][1:10,]
+dbrda_spp_data = dbrda_spp_data[order(percent),]
+dbrda_spp_data[,numerator := spp %>% gsub('\\/.*','',.)]
+dbrda_spp_data[,numerator := factor(numerator, levels = numerator)]
+
+dbrda_sero_bars = ggplot(data = dbrda_spp_data) +
+    geom_vline(xintercept = 0, linetype = 'dashed') +
+    geom_bar(aes(x = score, y = numerator)
+             , stat = 'identity'
+             , color = col_pal_sero_dark['Non-responder']
+             , fill = col_pal_sero_pale['Non-responder']) +
+    geom_vline(xintercept = 0, linetype = 'dashed', color = neutral_gray) +
+    geom_text(aes(x = score, y = numerator, label = (round(percent, 3)*100) %>% paste0(.,'%'))
+            , position = position_nudge(x = -0.0025), hjust = 1, vjust = 0.5
+            , color = neutral_gray, size = 3.2) +
+    ylab('') +
+    xlab('Axis Score') +
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) +
+    theme(panel.grid = element_blank(), legend.position = 'none') +
+    ggtitle('Contributing genera (dbRDA)')
+    #facet_grid(~'dbRDA1 contributing genera')
+
+plot_grid(dbrda_sero_jitterbox, dbrda_sero_bars, labels = c('A','B'))
+```
+
+## Differential abundance analysis plot at NB
+### Taxonomic
+```{r, fig.width = 4, fig.height = 5}
+load('diffabund.RData')
+library('ggrepel')
+library('ggplotify')
+
+## Diffabund volcano
+plottingdata = maaslin2_out_NB$results %>%  dplyr::filter(metadata == 'Seroconverted') %>% as.data.table()
+plottingdata[,signif := assign_stars(qval)]
+
+plottingdata[,spp := gsub('[a-z]+\\.', '. ', feature)]
+plottingdata[,feature2 := gsub('\\.', '\n', feature)]
+
+p1 = ggplot(plottingdata) +
+    geom_point(aes(x = coef, y = -log10(pval), color = signif)) +
+    geom_vline(xintercept = 0, linetype = 'dashed', color = neutral_gray) +
+    geom_text_repel(data = plottingdata[signif != 'n.s.' | spp == 'K. pneumoniae',]
+                  , aes(x = coef, y = -log10(pval), label = spp)
+                  , min.segment.length = 0
+                  , size = 3) +
+    #scale_y_log10() +
+    ylab('-log10(pvalue)') +
+    xlab('Seroconverison coef') +
+    scale_color_signif + 
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) +
+    theme(legend.title = element_text(size=11)) +
+    theme(legend.position = 'bottom', legend.title.position = 'top') +
+    theme(panel.grid = element_blank()) +
+    ggtitle('M1 Maaslin2') #+
+    #facet_grid('Month 1'~'Maaslin2, seroconversion')
+
+
+## Change facet label colors
+pdf(file = NULL)
+g = ggplot_gtable(ggplot_build(p1))
+dev.off()
+
+stripr <- which(grepl('strip-r', g$layout$name))
+fills <- col_pal_visit_light['NB']
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k = k+1
+}
+
+diffabund_volcano = as.ggplot(g)
+
+## Diffabund coefs with se
+p2 = ggplot(data = plottingdata[signif != 'n.s.',]) +
+    geom_vline(xintercept = 0, linetype = 'dashed', color = neutral_gray) +
+    geom_point(aes(x = coef, y = feature2, color = signif), size = 2) +
+    geom_errorbar(aes(y = feature2, xmax = coef + 2*stderr, xmin = coef - 2*stderr), width = 0.15) +
+    scale_color_signif + 
+    ylab('') +
+    xlab('Beta coefficient') +
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) +
+    theme(panel.grid = element_blank(), legend.position = 'none')# +
+   # facet_grid('Month 1'~'Enrichment among seroconverters')
+
+## Change facet label colors
+pdf(file = NULL)
+g = ggplot_gtable(ggplot_build(p2))
+dev.off()
+
+stripr <- which(grepl('strip-r', g$layout$name))
+fills <- col_pal_visit_light['NB']
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k = k+1
+}
+
+diffabund_bars = as.ggplot(g)
+
+#diffabund_plots = g1 %>% insert_bottom(g2)
+diffabund_plots = plot_grid(plotlist = list(diffabund_bars, diffabund_volcano), labels = c('C', ''), nrow = 2, rel_heights = c(1, 1.5))
+plot(diffabund_plots)
+```
+
+```{r, fig.width = 3, fig.height = 4}
+metacyc_nb_lps_all = fread('source-data/fig3/metacyc_lps_nb_all_results.tsv', sep='\t', header=TRUE)
+
+## Diffabund volcano
+plottingdata = metacyc_nb_lps_all %>%  dplyr::filter(metadata == 'Seroconverted') %>% as.data.table()
+plottingdata[,signif := assign_stars(qval)]
+
+plottingdata[,spp := feature]
+
+metacyc_nb_lps_all = ggplot(plottingdata) +
+    geom_point(aes(x = coef, y = -log10(pval), color = signif)) +
+    geom_vline(xintercept = 0, linetype = 'dashed', color = neutral_gray) +
+    geom_text_repel(data = plottingdata[signif == '*',]
+                  , aes(x = coef, y = -log10(pval), label = spp)
+                  , min.segment.length = 0
+                  , size = 3) +
+    #scale_y_log10() +
+    ylab('-log10(pvalue)') +
+    xlab('Seroconverison coef') +
+    scale_color_signif + 
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) +
+    theme(legend.title = element_text(size=11)) +
+    theme(legend.position = 'bottom', legend.title.position = 'top') +
+    theme(panel.grid = element_blank()) +
+    ggtitle('MetaCyc Maaslin2 (M1)') #+
+    #facet_grid('Month 1'~'Maaslin2, seroconversion')
+
+plot(metacyc_nb_lps_all)
+
+```
+
+### KO-lps
+```{r, fig.width = 3, fig.height = 4}
+KO_lps_nb = fread('source-data/fig3/KO_lps_nb_all_results.tsv', sep='\t', header=TRUE)
+
+## Diffabund volcano
+plottingdata = KO_lps_nb %>%  dplyr::filter(metadata == 'Seroconverted') %>% as.data.table()
+plottingdata[,signif := assign_stars(qval)]
+
+plottingdata[,spp := feature]
+plottingdata[,spp := gsub('Klebsiella.michiganensis.', 'kom:', spp)]
+plottingdata[,spp := gsub('Klebsiella.grimontii.', 'kgr:', spp)]
+
+ko_lps_nb_volcano = ggplot(plottingdata) +
+    geom_point(aes(x = coef*-1, y = -log10(pval), color = signif)) +
+    geom_vline(xintercept = 0, linetype = 'dashed', color = neutral_gray) +
+    geom_text_repel(data = plottingdata[signif != 'n.s.',]
+                  , aes(x = coef*-1, y = -log10(pval), label = spp)
+                  , min.segment.length = 0
+                  , size = 3) +
+    #scale_y_log10() +
+    ylab('-log10(pvalue)') +
+    xlab('Maaslin2 coef') +
+    scale_color_signif + 
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) +
+    theme(legend.title = element_text(size=11)) +
+    theme(legend.position = 'bottom', legend.title.position = 'top') +
+    theme(panel.grid = element_blank()) +
+    ggtitle('Species:KEGG Maaslin2 (M1)') #+
+    #facet_grid('Month 1'~'Maaslin2, seroconversion')
+
+plot(ko_lps_nb_volcano)
+
+svglite('figures/figure-3D.svg', width = 3, height = 4, fix_text_size = FALSE)
+    plot(ko_lps_nb_volcano)
+dev.off()
+
+#fwrite(plottingdata, 'source-data/ed-fig3/ko-lps-results.txt.xls', sep = '\t')
+```
+
+### MetaCyc-lps
+```{r, fig.width = 3, fig.height = 2.5}
+metacyc_nb_lps_all = fread('source-data/fig3/metacyc_lps_nb_all_results.tsv', sep='\t', header=TRUE)
+
+## Diffabund volcano
+plottingdata = metacyc_nb_lps_all %>%  dplyr::filter(metadata == 'Seroconverted') %>% as.data.table()
+plottingdata[,signif := assign_stars(qval)]
+
+plottingdata[order(coef), spp := factor(feature, levels = feature)]
+
+metacyc_nb_lps_plot = ggplot(plottingdata) +
+    
+    geom_vline(xintercept = 0, linetype = 'dashed', color = neutral_gray) +
+    geom_bar(aes(x = coef*-1, y = spp, fill = signif), stat = 'identity') +
+    geom_errorbar(aes(y = spp, xmax = (coef + 2*stderr)*-1, xmin = (coef - 2*stderr)*-1), width = 0.15) +
+    #scale_color_signif + 
+    scale_fill_signif + 
+    ylab('') +
+    xlab('Maaslin2 coef') +
+    theme_bw() + 
+    ggtitle('MetaCyc LPS\nDiff. Abund.') +
+    theme(plot.title = element_text(size=11)) +
+    theme(panel.grid = element_blank()
+        , legend.position = 'bottom'
+        , legend.title.position = 'top'
+        , legend.key.size = unit(0.25, 'cm')
+        , legend.key.height = unit(0.25, 'cm')
+        , legend.key.width = unit(0.25, 'cm'))
+
+plot(metacyc_nb_lps_plot)
+
+svglite('figures/figure-3C.svg', width = 3, height = 2.5, fix_text_size = FALSE)
+    plot(metacyc_nb_lps_plot)
+dev.off()
+
+#fwrite(plottingdata, 'source-data/ed-fig3/metacyc-lps-results.txt.xls', sep = '\t')
+```
+
+### MetaCyc-all
+```{r, fig.width = 3.5, fig.height = 7.5}
+metacyc_nb_all = fread('source-data/fig3/metacyc_nb_all_results.tsv', sep='\t', header=TRUE)
+
+## Diffabund volcano
+plottingdata = metacyc_nb_all %>%  dplyr::filter(metadata == 'Seroconverted') %>% as.data.table()
+plottingdata[,signif := assign_stars(qval)]
+
+plottingdata[order(coef), spp := factor(feature, levels = feature)]
+
+metacyc_nb_plot = ggplot(plottingdata[signif != 'n.s.',]) +
+    
+    geom_vline(xintercept = 0, linetype = 'dashed', color = neutral_gray) +
+    geom_bar(aes(x = coef*-1, y = spp, fill = signif), stat = 'identity') +
+    geom_errorbar(aes(y = spp, xmax = (coef + 2*stderr)*-1, xmin = (coef - 2*stderr)*-1), width = 0.15) +
+    #scale_color_signif + 
+    scale_fill_signif + 
+    ylab('') +
+    xlab('Maaslin2 coef') +
+    theme_bw() + 
+    ggtitle('MetaCyc\nDiff. Abund. (M1)') +
+    theme(plot.title = element_text(size=11)) +
+    theme(panel.grid = element_blank()
+        , legend.position = 'bottom'
+        , legend.title.position = 'top'
+        , legend.key.size = unit(0.25, 'cm')
+        , legend.key.height = unit(0.25, 'cm')
+        , legend.key.width = unit(0.25, 'cm'))
+
+plot(metacyc_nb_plot)
+
+svglite('figures/extended-data-figure-3B.svg', width = 3.5, height = 7.5, fix_text_size = FALSE)
+    plot(metacyc_nb_plot)
+dev.off()
+
+fwrite(plottingdata, 'source-data/ed-fig3/metacyc-results.txt.xls', sep = '\t')
+
+```
+
+### Diffabund-Full
+```{r, fig.width = 3, fig.height = 7.5}
+plottingdata = results[['global']]
+
+## Render volcano-ish plot.
+plottingdata[,signif := assign_stars(padj)]
+
+plottingdata[,errmin := effectSize - 2*SE]
+plottingdata[,errmax := effectSize + 2*SE]
+signif_spp = plottingdata[padj < qval_threshold, Species] %>% unique()
+
+errdata = plottingdata[Species %in% signif_spp,][,.(errcords = c(errmin,errmax)), by = .(Species, method)]
+
+p1 =  ggplot(data = plottingdata) +
+    geom_point(aes(x = effectSize, y = -log10(pval), color = signif)) +
+    facet_wrap(method~., scales = 'free_x', ncol = 1) +
+    scale_y_log10() +
+    ylab('-log10(pvalue)') +
+    xlab('Maaslin2 coef') +
+    scale_color_signif + 
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) +
+    theme(legend.title = element_text(size=11)) +
+    theme(legend.position = 'bottom', legend.title.position = 'top') +
+    theme(panel.grid = element_blank()) +
+    
+    ggtitle('Taxonomic Differential Abundance') #+
+
+p2 = ggplot(data = plottingdata[Species %in% signif_spp,]) +
+    geom_bar(aes(x = effectSize, y = Species, fill = signif), stat = 'identity') +
+    facet_wrap(method~., scales = 'free_x', ncol = 1) +
+    geom_errorbar(aes(y = Species, xmax = effectSize + 2*SE, xmin = effectSize - 2*SE), width = 0.15) +
+    #scale_color_signif + 
+    scale_fill_signif + 
+    ylab('') +
+    xlab('Maaslin2 coef') +
+    theme_bw() + 
+    ggtitle('Species\nDiff. Abund.') +
+    theme(plot.title = element_text(size=11)) +
+    theme(panel.grid = element_blank()
+        , legend.position = 'bottom'
+        , legend.title.position = 'top'
+        , legend.key.size = unit(0.25, 'cm')
+        , legend.key.height = unit(0.25, 'cm')
+        , legend.key.width = unit(0.25, 'cm'))
+
+
+svglite('figures/extended-data-figure-3A.svg', width = 3.5, height = 7.5, fix_text_size = FALSE)
+    plot(p2)
+dev.off()
+
+fwrite(plottingdata, 'source-data/ed-fig3/maaslin-results.txt.xls', sep = '\t')
+```
+
+## Render Figure 3
+```{r, fig.width = 6.5, fig.height = 3}
+#s1 = plot_grid(dbrda_sero_bars, '', rel_heights = c(1, 0.25), ncol = 1)
+#s2 = plot_grid(dbrda_sero_jitterbox, s1, labels = c('A','B'), nrow = 1)
+#r1 = plot_grid(s2, '', nrow = 1, rel_widths = c(6, 1.5))
+#r2c1 = diffabund_plots
+
+c1 = plot_grid(dbrda_sero_bars,'', rel_heights = c(1, 0.35), nrow = 2)
+c2 = diffabund_volcano
+
+r1 = plot_grid(c1, c2, labels = c('A', 'B'), ncol = 2)
+
+plot(r1)
+
+plot_grid(r1, r2, nrow = 2, rel_heights = c(3, 2))
+
+svglite('figures/figure-3AB.svg', width = 6.5, height = 2.8, fix_text_size = FALSE)
+    plot(r1)
+dev.off()
+
+
+svglite('figures/figure-3CD.svg', width = 7, height = 5.5, fix_text_size = FALSE)
+    plot(r2)
+dev.off()
+
+## dbRDA species scores
+fwrite(sppscores[order(percent) %>% rev(),]
+     , 'source-data/fig3/dbrda-contributing-genera.txt.xls',sep='\t')
+
+## Differential abundance
+fwrite(results[['global']], 'source-data/fig3/combined-diffabund.txt.xls', sep='\t')
+fwrite(maaslin2_out_NB$results, 'source-data/fig3/m1-maaslin2.txt.xls', sep = '\t')
+fwrite(maaslin2_out_2mo$results, 'source-data/fig3/m2-maaslin2.txt.xls', sep = '\t')
+fwrite(maaslin2_out_4mo$results, 'source-data/fig3/m4-maaslin2.txt.xls', sep = '\t')
+
+## Functional diffabunds are already written to the file.
+```
+
+
+# Figure 4: DMMs
+```{r}
+load(file = 'dmms.RData')
+```
+
+## Multinomial plots
+```{r MultinomialPlots, fig.width = 2.5, fig.height = 5}
+library('ggplot2')
+library('data.table')
+library('magrittr')
+## Vs cs-GCT3
+# > print(seroconverted_pdmm3_NB)
+#                 pval        OR     coef        se signif
+# cs.DMM1 0.0090270784  4.994811 1.608400 0.6160027     **
+# cs.DMM2 0.0502142029  3.316546 1.198924 0.6122786      .
+# cs.DMM4 0.0992615591  2.902451 1.065555 0.6464007      .
+# cs.DMM5 0.0275939527  5.226373 1.653718 0.7506623      *
+# cs.DMM6 0.0003025822 21.039282 3.046391 0.8431565    ***
+dats = as.data.table(seroconverted_pdmm3_NB, keep.rownames=TRUE)
+dats[,Significance := gsub('\\*\\*+','\\*', signif)] ## single-star significance level
+
+sero_odds_vdmm3 = ggplot(data = dats) +
+        
+    ## add in error bars
+    geom_errorbar(aes(x = gsub('cs.DMM','cs-GCT', rn), ymax = coef + 2*se, ymin = coef - 2*se), width = 0.15) +
+    
+    ## render points
+    geom_point(aes(x = gsub('cs.DMM','cs-GCT', rn), y = coef, color = Significance), size = 2) +
+    
+    ## color scale for significance
+    scale_color_signif + 
+    ylab('log(OR)') +
+    xlab('') +
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) +
+    ggtitle('Seroconversion odds') +
+    geom_hline(yintercept = 0, linetype = 'dashed') +
+    theme(panel.grid = element_blank()
+        , legend.position = 'none'
+        , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    facet_grid(~'M1 type vs. cs-GCT3') +
+    ylim(c(-0.5,6))
+
+## Shedding
+dats = as.data.table(stool_pcr_pdmm3_NB, keep.rownames=TRUE)
+dats[,Significance := gsub('\\*\\*+','\\*', signif)]
+
+shedding_odds_vdmm3 = ggplot(data = dats) +
+    geom_errorbar(aes(x = gsub('cs.DMM','cs-GCT', rn), ymax = coef + 2*se, ymin = coef - 2*se), width = 0.15) +
+    geom_point(aes(x = gsub('cs.DMM','cs-GCT', rn), y = coef, color = Significance), size = 2) +
+    scale_color_signif + 
+    ylab('log(OR)') +
+    xlab('') +
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) +
+    ggtitle('Shedding odds') +
+    geom_hline(yintercept = 0, linetype = 'dashed', color = neutral_gray) +
+    theme(panel.grid = element_blank()
+        , legend.position = 'none'
+        , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    facet_grid(~'M1 type vs. cs-GCT3') +
+    ylim(c(-0.5,6))
+
+dats = as.data.table(seroconverted_pdmm6_NB, keep.rownames=TRUE)
+dats[,Significance := gsub('\\*\\*+','\\*', signif)]
+
+## Vs cs-GCT6
+## Sero
+sero_odds_vdmm6 = ggplot(data = dats) +
+    geom_errorbar(aes(x = gsub('cs.DMM','cs-GCT', rn), ymax = coef + 2*se, ymin = coef - 2*se), width = 0.15) +
+    geom_point(aes(x = gsub('cs.DMM','cs-GCT', rn), y = coef, color = Significance), size = 2) +
+    scale_color_signif + 
+    ylab('log(Odds Ratio) difference') +
+    xlab('') +
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) +
+    ggtitle('Seroconversion') +
+    geom_hline(yintercept = 0, linetype = 'dashed', color = neutral_gray) +
+    theme(panel.grid = element_blank()
+        , legend.position = 'none'
+        , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    facet_grid(~'M1 type vs. cs-GCT6') +
+    ylim(c(-6,0.5))
+
+pdf(file = NULL)
+    pl = ggpubr::get_legend(sero_odds_vdmm6 + theme(legend.position = 'bottom', legend.title.position = 'top'))
+dev.off()
+
+odds_multinom = plot_grid(sero_odds_vdmm3, shedding_odds_vdmm3, nrow = 2, rel_widths = c(1, 1), align = "v", axis = "l") %>% plot_grid(., pl, rel_heights = c(1, 0.2), nrow = 2)
+
+plot(odds_multinom)
+
+svglite('figures/odds-multinom.svg', width = 2.5, height = 5, fix_text_size = FALSE)
+    plot(odds_multinom)
+dev.off()
+
+fwrite(seroconverted_pdmm3_NB %>% as.data.table(keep.rownames = TRUE), 'source-data/fig4/multinomial-or-sero-dmm3.txt.xls', sep = '\t')
+fwrite(stool_pcr_pdmm3_NB %>% as.data.table(keep.rownames = TRUE), 'source-data/fig4/multinomial-or-pcr-dmm3.txt.xls', sep = '\t')
+
+```
+
+## Taxon barplots
+```{r}
+library('ggplot2')
+library('rlang')
+library('ggnewscale')
+```
+
+```{r NB_taxon_bars, fig.width = 5, fig.height = 3.5}
+dmm_NB_spp_melt = data.table::melt(dmm_NB_spp) %>% as.data.table()
+ncoll_spp = dmm_NB_spp_melt[value > collapse_thresh, Var2] %>%
+    unique() %>%
+    as.character()
+
+breaks = c(ncoll_spp, collapse_str)
+n = length(ncoll_spp)
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)) %>%
+    unlist()
+
+## Seed set to 113.
+set.seed(113)
+colpal = sample(col_vector, n) %>%
+    c(. , '#AAAAAA') %>%
+    setNames(., breaks)
+
+## set order based on relabund
+breakorder = dmm_NB_spp_plot[order(-value), Var2] %>% unique() %>% as.character() %>% setdiff(collapse_str) %>% c(collapse_str)
+
+## Phylum associations
+taxon_phyl_assoc = taxonomy[g %in% breakorder,.(p, g)] %>% unique() %>% split(by = 'p')
+
+dmm_NB_spp_plot[,csGCT := gsub('cs.DMM','M1 cs-GCT', NB)]
+taxon_bars_nb_all = ggplot() + 
+    geom_bar(aes(fill=factor(Var2, levels = breakorder), y=value, x=Var1)
+             , color = NA, position='stack', stat='identity'
+             , data = dmm_NB_spp_plot) +
+    facet_wrap(~csGCT, scales = 'free_x', ncol = 2) + 
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) +
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+    theme(legend.key.size = unit(0.25, 'cm')
+        , legend.key.height = unit(0.25, 'cm')
+        , legend.key.width = unit(0.25, 'cm')
+        , axis.ticks = element_blank()
+        #, legend.title = element_text(size=14)
+        #, legend.text = element_text(size=10)
+        ) +
+    scale_y_continuous(labels = scales::percent, expand = c(0,0)) +
+    scale_x_discrete(expand = c(0,0)) +
+    xlab('Individual') +
+    ylab('Genus-level composition (%)') +
+    scale_fill_manual(values = colpal, breaks = breakorder, name = 'Genus', guide = guide_legend(ncol = 1))
+
+
+## Change facet label colors
+pdf(file = NULL)
+g = ggplot_gtable(ggplot_build(taxon_bars_nb_all))
+dev.off()
+
+stripr <- which(grepl('strip-t', g$layout$name))
+fills <- col_pal_visit_light['NB']
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  #k = k+1
+}
+
+taxon_bars_nb_all = as.ggplot(g)
+
+plot(taxon_bars_nb_all)
+```
+
+```{r 2mo_taxon_bars}
+dmm_2mo_spp_melt = melt(dmm_2mo_spp) %>% as.data.table()
+ncoll_spp = dmm_2mo_spp_melt[value > collapse_thresh, Var2] %>%
+    unique() %>%
+    as.character()
+
+breaks = c(ncoll_spp, collapse_str)
+n = length(ncoll_spp)
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)) %>%
+    unlist()
+
+## use the previous palette for  consistency between plots.
+diffs = setdiff(ncoll_spp, names(colpal))
+
+if(length(diffs) != 0)
+{
+    col_vector = setdiff(col_vector, colpal)
+    n2 = length(diffs)
+    colpal2 = sample(col_vector, n2) %>%
+        setNames(., names(diffs))
+    
+    colpal = c(colpal2, colpal)
+}
+
+## set order based on relabund
+breakorder = dmm_2mo_spp_plot[order(-value), Var2] %>% unique() %>% as.character() %>% setdiff(collapse_str) %>% c(collapse_str)
+
+dmm_2mo_spp_plot[,csGCT := gsub('cs.DMM','M2 cs-GCT', X2mo)]
+
+taxon_bars_2mo_all = ggplot() + 
+    geom_bar(aes(fill=factor(Var2, levels = breakorder), y=value, x=Var1)
+             , color = NA, position='stack', stat='identity'
+             , data = dmm_2mo_spp_plot) +
+    facet_wrap(~csGCT, scales = 'free_x') + 
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) +
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+    theme(legend.key.size = unit(0.25, 'cm')
+        , legend.key.height = unit(0.25, 'cm')
+        , legend.key.width = unit(0.25, 'cm')
+        , axis.ticks = element_blank()
+        #, legend.title = element_text(size=14)
+        #, legend.text = element_text(size=10)
+        ) +
+    scale_y_continuous(labels = scales::percent, expand = c(0,0)) +
+    scale_x_discrete(expand = c(0,0)) +
+    xlab('Individual') +
+    ylab('Genus-level composition (%)') +
+    scale_fill_manual(values = colpal, breaks = breakorder, name = 'Genus', guide = guide_legend(ncol = 1))
+
+
+## Change facet label colors
+pdf(file = NULL)
+g = ggplot_gtable(ggplot_build(taxon_bars_2mo_all))
+dev.off()
+
+stripr <- which(grepl('strip-t', g$layout$name))
+fills <- col_pal_visit_light['2mo']
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  #k = k+1
+}
+
+taxon_bars_2mo_all = as.ggplot(g)
+
+plot(taxon_bars_2mo_all)
+
+filtered_eids = cs_dmm_data[!is.na(X2mo), enrollment_id]
+
+dmm_2mo_sel_coll = dmm_2mo_sel_coll = dmm_2mo_spp_melt[!(Var2 %in% ncoll_spp)
+                                  & Var1 %in% filtered_eids
+                                  , .(Var2 = collapse_str
+                                  , value =  sum(value)), by = Var1][,.(Var1, Var2, value)] %>%
+    rbind(dmm_2mo_spp_melt[(Var2 %in% ncoll_spp) & Var1 %in% filtered_eids,],.)
+
+fwrite(dmm_2mo_sel_coll, 'source-data/ed-fig4/m2-genus-composition.txt.xls', sep = '\t')
+```
+
+```{r 4mo_taxon_bars}
+dmm_4mo_spp_melt = melt(dmm_4mo_spp) %>% as.data.table()
+ncoll_spp = dmm_4mo_spp_melt[value > collapse_thresh, Var2] %>%
+    unique() %>%
+    as.character()
+
+breaks = c(ncoll_spp, collapse_str)
+n = length(ncoll_spp)
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)) %>%
+    unlist()
+
+## use the previous palette for  consistency between plots.
+diffs = setdiff(ncoll_spp, names(colpal))
+
+if(length(diffs) != 0)
+{
+    col_vector = setdiff(col_vector, colpal)
+    n2 = length(diffs)
+    colpal2 = sample(col_vector, n2) %>%
+        setNames(., names(diffs))
+    
+    colpal = c(colpal2, colpal)
+}
+
+dmm_4mo_spp_plot[,csGCT := gsub('cs.DMM','M4 cs-GCT', X4mo)]
+taxon_bars_4mo_all = ggplot() + 
+    geom_bar(aes(fill=factor(Var2, levels = breakorder), y=value, x=Var1)
+             , color = NA, position='stack', stat='identity'
+             , data = dmm_4mo_spp_plot) +
+    facet_wrap(~csGCT, scales = 'free_x') + 
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) +
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+    theme(legend.key.size = unit(0.25, 'cm')
+        , legend.key.height = unit(0.25, 'cm')
+        , legend.key.width = unit(0.25, 'cm')
+        , axis.ticks = element_blank()
+        #, legend.title = element_text(size=14)
+        #, legend.text = element_text(size=10)
+        ) +
+    scale_y_continuous(labels = scales::percent, expand = c(0,0)) +
+    scale_x_discrete(expand = c(0,0)) +
+    xlab('Individual') +
+    ylab('Genus-level composition (%)') +
+    scale_fill_manual(values = colpal, breaks = breakorder, name = 'Genus', guide = guide_legend(ncol = 1))
+
+## Change facet label colors
+pdf(file = NULL)
+g = ggplot_gtable(ggplot_build(taxon_bars_4mo_all))
+dev.off()
+
+stripr <- which(grepl('strip-t', g$layout$name))
+fills <- col_pal_visit_light['4mo']
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  #k = k+1
+}
+
+filtered_eids = cs_dmm_data[!is.na(X4mo), enrollment_id]
+
+dmm_4mo_sel_coll = dmm_4mo_sel_coll = dmm_4mo_spp_melt[
+    !(Var2 %in% ncoll_spp) & Var1 %in% filtered_eids
+, .(Var2 = collapse_str, value =  sum(value)), by = Var1][,.(Var1, Var2, value)] %>%
+    rbind(dmm_4mo_spp_melt[(Var2 %in% ncoll_spp) & Var1 %in% filtered_eids,],.)
+
+fwrite(dmm_4mo_sel_coll, 'source-data/ed-fig4/m4-genus-composition.txt.xls', sep = '\t')
+
+taxon_bars_4mo_all = as.ggplot(g)
+
+plot(taxon_bars_4mo_all)
+```
+
+```{r, fig.width = 10, fig.height = 2.5}
+library('ggh4x')
+## barplots with just M1 csGCT3 & csGCT6
+filtered_eids = cs_dmm_data[!is.na(NB), enrollment_id]
+
+ncoll_spp = dmm_NB_spp_melt[value > collapse_thresh & Var1 %in% filtered_eids, Var2] %>%
+    unique() %>%
+    as.character()
+
+breaks = c(ncoll_spp, collapse_str)
+n = length(ncoll_spp)
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)) %>%
+    unlist()
+
+## use the previous palette for  consistency between plots.
+diffs = setdiff(ncoll_spp, names(colpal))
+
+if(length(diffs) != 0)
+{
+    col_vector = setdiff(col_vector, colpal)
+    n2 = length(diffs)
+    colpal2 = sample(col_vector, n2) %>%
+        setNames(., names(diffs))
+    
+    colpal = c(colpal2, colpal)
+}
+
+dmm_NB_sel_coll = dmm_NB_spp_melt[!(Var2 %in% ncoll_spp)
+                                  & Var1 %in% filtered_eids
+                                  , .(Var2 = collapse_str
+                                  , value =  sum(value)), by = Var1][,.(Var1, Var2, value)] %>%
+    rbind(dmm_NB_spp_melt[(Var2 %in% ncoll_spp) & Var1 %in% filtered_eids,],.)
+
+dmm_NB_sel_plot = setkey(copy(cs_dmm_data), enrollment_id)[dmm_NB_sel_coll[,Var1] %>% as.character(),] %>%
+    cbind(dmm_NB_sel_coll,.)
+
+## set order based on relabund
+breakorder = dmm_NB_sel_plot[order(-value), Var2] %>% unique() %>% as.character() %>% setdiff(collapse_str) %>% c(collapse_str)
+
+## Phylum associations
+taxon_phyl_assoc = taxonomy[g %in% breakorder,.(p, g)] %>% unique() %>% split(by = 'p')
+
+dmm_NB_sel_plot[!is.na(NB), csGCT := gsub('cs.DMM','M1 cs-GCT', NB)]
+taxon_bars_nb_sel = ggplot() + 
+    geom_bar(aes(fill=factor(Var2, levels = breakorder), y=value, x=Var1)
+             , color = NA, position='stack', stat='identity'
+             , data = dmm_NB_sel_plot) +
+    facet_nested(.~csGCT + country, scales = 'free', space = 'free', nest_line = element_line(linetype = 1)) + 
+    theme_bw() + 
+    theme(panel.spacing = unit(0, "cm")) +
+    theme(plot.title = element_text(size=11)) +
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+    theme(legend.key.size = unit(0.25, 'cm')
+        , legend.key.height = unit(0.25, 'cm')
+        , legend.key.width = unit(0.25, 'cm')
+        , axis.ticks = element_blank()
+        #, legend.title = element_text(size=14)
+        #, legend.text = element_text(size=10)
+        ) +
+    scale_y_continuous(labels = scales::percent, expand = c(0,0)) +
+    scale_x_discrete(expand = c(0,0)) +
+    xlab('Individual') +
+    ylab('Genus-level composition (%)') +
+    scale_fill_manual(values = colpal, breaks = breakorder, name = 'Genus', guide = guide_legend(ncol = 2))
+
+## Change facet label colors
+pdf(file = NULL)
+g = ggplot_gtable(ggplot_build(taxon_bars_nb_sel))
+dev.off()
+
+stripr <- which(grepl('strip-t', g$layout$name))
+fills <- c(rep(col_pal_visit_light['NB'],6), rep(col_pal_country_light, 6))
+colors <- c(rep(col_pal_visit_dark['NB'],6), rep(col_pal_country_dark, 6))
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$col <- colors[k]
+  k = k+1
+}
+
+taxon_bars_nb_sel = as.ggplot(g)
+
+plot(taxon_bars_nb_sel)
+
+svglite('figures/genus-taxon-bars.svg', width = 11, height = 2.5, fix_text_size = FALSE)
+    plot(taxon_bars_nb_sel)
+dev.off()
+
+fwrite(dmm_NB_sel_coll, 'source-data/fig4/genus-level-composition.txt.xls', sep = '\t')
+
+```
+
+```{r, fig.width = 6.5, fig.height = 2.8}
+library('ggh4x')
+## barplots with just M1 csGCT3 & csGCT6
+filtered_eids = cs_dmm_data[NB %in% c('cs.DMM3', 'cs.DMM6'), enrollment_id]
+
+ncoll_spp = dmm_NB_spp_melt[value > collapse_thresh & Var1 %in% filtered_eids, Var2] %>%
+    unique() %>%
+    as.character()
+
+breaks = c(ncoll_spp, collapse_str)
+n = length(ncoll_spp)
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)) %>%
+    unlist()
+
+## use the previous palette for  consistency between plots.
+diffs = setdiff(ncoll_spp, names(colpal))
+
+if(length(diffs) != 0)
+{
+    col_vector = setdiff(col_vector, colpal)
+    n2 = length(diffs)
+    colpal2 = sample(col_vector, n2) %>%
+        setNames(., names(diffs))
+    
+    colpal = c(colpal2, colpal)
+}
+
+dmm_NB_sel_coll = dmm_NB_spp_melt[!(Var2 %in% ncoll_spp)
+                                  & Var1 %in% filtered_eids
+                                  , .(Var2 = collapse_str
+                                  , value =  sum(value)), by = Var1][,.(Var1, Var2, value)] %>%
+    rbind(dmm_NB_spp_melt[(Var2 %in% ncoll_spp) & Var1 %in% filtered_eids,],.)
+
+dmm_NB_sel_plot = setkey(copy(cs_dmm_data), enrollment_id)[dmm_NB_sel_coll[,Var1] %>% as.character(),] %>%
+    cbind(dmm_NB_sel_coll,.)
+
+## set order based on relabund
+breakorder = dmm_NB_sel_plot[order(-value), Var2] %>% unique() %>% as.character() %>% setdiff(collapse_str) %>% c(collapse_str)
+
+## Phylum associations
+taxon_phyl_assoc = taxonomy[g %in% breakorder,.(p, g)] %>% unique() %>% split(by = 'p')
+
+dmm_NB_sel_plot[NB %in% c('cs.DMM3', 'cs.DMM6'), csGCT := gsub('cs.DMM','M1 cs-GCT', NB)]
+taxon_bars_nb_sel = ggplot() + 
+    geom_bar(aes(fill=factor(Var2, levels = breakorder), y=value, x=Var1)
+             , color = NA, position='stack', stat='identity'
+             , data = dmm_NB_sel_plot) +
+    facet_nested(.~csGCT + country, scales = 'free', space = 'free', nest_line = element_line(linetype = 1)) + 
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) +
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+    theme(legend.key.size = unit(0.25, 'cm')
+        , legend.key.height = unit(0.25, 'cm')
+        , legend.key.width = unit(0.25, 'cm')
+        , axis.ticks = element_blank()
+        #, legend.title = element_text(size=14)
+        #, legend.text = element_text(size=10)
+        ) +
+    scale_y_continuous(labels = scales::percent, expand = c(0,0)) +
+    scale_x_discrete(expand = c(0,0)) +
+    xlab('Individual') +
+    ylab('Genus-level composition (%)') +
+    scale_fill_manual(values = colpal, breaks = breakorder, name = 'Genus', guide = guide_legend(ncol = 1))
+
+## Change facet label colors
+pdf(file = NULL)
+g = ggplot_gtable(ggplot_build(taxon_bars_nb_sel))
+dev.off()
+
+stripr <- which(grepl('strip-t', g$layout$name))
+fills <- c(rep(col_pal_visit_light['NB'],2), rep(col_pal_country_light, 2))
+
+k = 1
+for (i in stripr) {
+  j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+  g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k = k+1
+}
+
+taxon_bars_nb_sel = as.ggplot(g)
+
+plot(taxon_bars_nb_sel)
+```
+
+
+## DMM Differential abundances
+```{r vDMM6, fig.width = 6.5, fig.height = 2.5}
+
+dmms = cs_dmm_data[,NB] %>% unique() %>% na.omit() %>% setdiff('cs.DMM6')
+
+dmmdiffs = lapply(dmms, function(dmm)
+{
+    res = ancombc2_dmm6$res %>%
+        dplyr::select(taxon, c(paste0('lfc_NB', dmm)
+                           , paste0('se_NB', dmm)
+                           , paste0('p_NB', dmm)
+                           , paste0('q_NB', dmm))) %>%
+        as.data.table()
+    colnames(res) = c('taxon', 'l2fc', 'se', 'p', 'q')
+    res$group = dmm
+    res$signif =  ifelse(res$q < 0.1, '.', '') %>% ifelse(res$q < 0.05, '*', .) 
+    return(res)
+}) %>% do.call('rbind',.)
+dmmdiffs$ref = 'cs.DMM6'
+
+anydifftax = dmmdiffs[signif != '', taxon] %>% unique()
+dmmdiffs[,csGCT := gsub('cs.DMM','M1 cs-GCT', group)]
+dmmdiffs[signif == '', signif := 'n.s.']
+vs_dmm6_coefplot = ggplot(data = dmmdiffs[taxon %in% anydifftax,]) +
+
+    geom_vline(xintercept = 0, linetype = 'dashed', color = neutral_gray) +
+    geom_bar(aes(x = l2fc, y = taxon, fill = signif), stat = 'identity') +
+    geom_errorbar(aes(y = taxon, xmax = l2fc + 2*se, xmin = l2fc - 2*se), width = 0.15) +
+    #scale_color_signif + 
+    scale_fill_signif + 
+    ylab('') +
+    xlab('ANCOM-BC2 coefficient') +
+    theme_bw() + 
+    ggtitle('Differential abundance\nvs. cs-GCT6') +
+    theme(plot.title = element_text(size=11)) +
+    theme(panel.grid = element_blank()
+        , legend.position = 'bottom'
+        , legend.title.position = 'top'
+        , legend.key.size = unit(0.25, 'cm')
+        , legend.key.height = unit(0.25, 'cm')
+        , legend.key.width = unit(0.25, 'cm')) +
+    facet_grid(~ csGCT)
+
+svglite('figures/dmm6-diffabunds.svg', width = 6.5, height = 2.5, fix_text_size = FALSE)
+    plot(vs_dmm6_coefplot)
+dev.off()
+
+fwrite(dmmdiffs, 'source-data/fig4/diffabund-vs-dmm6.txt.xls', sep='\t')
+
+```
+
+
+```{r, fig.width=4, fig.height = 2.5}
+dmm6_vs_dmms_coefplot = ggplot(data = dmmdiffs[group %in% c('cs.DMM3', 'cs.DMM2') & taxon %in% anydifftax,]) +
+    geom_vline(xintercept = 0, linetype = 'dashed', color = neutral_gray) +
+    #geom_point(aes(x = l2fc, y = taxon, color = signif), size = 2) +
+    geom_bar(aes(x = l2fc, y = taxon, fill = signif), stat = 'identity') +
+    geom_errorbar(aes(y = taxon, xmax = l2fc + 2*se, xmin = l2fc - 2*se), width = 0.15) +
+    #scale_color_signif + 
+    scale_fill_signif + 
+    ylab('') +
+    xlab('ANCOM-BC2 l2fc') +
+    theme_bw() + 
+    ggtitle('ANCOM-BC2 vs. M1 cs-GCT6') +
+    theme(plot.title = element_text(size=11)) +
+    theme(panel.grid = element_blank()
+        , legend.position = 'bottom'
+        , legend.title.position = 'top'
+        ,legend.key.size = unit(0.25, 'cm')
+        , legend.key.height = unit(0.25, 'cm')
+        , legend.key.width = unit(0.25, 'cm')) +
+    facet_grid(~csGCT)
+plot(dmm6_vs_dmms_coefplot)
+
+svglite('figures/dmm6-diffabunds-limited.svg', width = 4, height = 2.5, fix_text_size = FALSE)
+    plot(dmm6_vs_dmms_coefplot)
+dev.off()
+
+```
+
+
+```{r vDMM3, fig.width = 6.5, fig.height = 3.5}
+dmms = cs_dmm_data[,NB] %>% unique() %>% na.omit() %>% setdiff('cs.DMM3')
+
+dmmdiffs = lapply(dmms, function(dmm)
+{
+    res = ancombc2_dmm3$res %>%
+        dplyr::select(taxon, c(paste0('lfc_NB', dmm)
+                           , paste0('se_NB', dmm)
+                           , paste0('p_NB', dmm)
+                           , paste0('q_NB', dmm))) %>%
+        as.data.table()
+    colnames(res) = c('taxon', 'l2fc', 'se', 'p', 'q')
+    res$group = dmm
+    res$signif =  ifelse(res$q < 0.1, '.', '') %>% ifelse(res$q < 0.05, '*', .) 
+    return(res)
+}) %>% do.call('rbind',.)
+dmmdiffs$ref = 'cs.DMM3'
+
+anydifftax = dmmdiffs[signif != '', taxon] %>% unique()
+dmmdiffs[,csGCT := gsub('cs.DMM','M1 cs-GCT', group)]
+dmmdiffs[signif == '', signif := 'n.s.']
+
+vs_dmm3_coefplot = ggplot(data = dmmdiffs[taxon %in% anydifftax,]) +
+
+    geom_vline(xintercept = 0, linetype = 'dashed', color = neutral_gray) +
+    geom_bar(aes(x = l2fc, y = taxon, fill = signif), stat = 'identity') +
+    geom_errorbar(aes(y = taxon, xmax = l2fc + 2*se, xmin = l2fc - 2*se), width = 0.15) +
+    #scale_color_signif + 
+    scale_fill_signif + 
+    ylab('') +
+    xlab('ANCOM-BC2 l2fc') +
+    theme_bw() + 
+    ggtitle('Differential abundance\nvs. cs-GCT3') +
+    theme(plot.title = element_text(size=11)) +
+    theme(panel.grid = element_blank()
+        , legend.position = 'bottom'
+        , legend.title.position = 'top'
+        , legend.key.size = unit(0.25, 'cm')
+        , legend.key.height = unit(0.25, 'cm')
+        , legend.key.width = unit(0.25, 'cm')) +
+    facet_grid(~ csGCT)
+
+plot(vs_dmm3_coefplot)
+
+svglite('figures/dmm3-diffabunds.svg', width = 6.5, height = 3.5, fix_text_size = FALSE)
+    plot(vs_dmm3_coefplot)
+dev.off()
+
+fwrite(dmmdiffs, 'source-data/ed-fig5/diffabunds.txt.xls', sep = '\t')
+
+```
+
+### Extended data multinomial plots.
+```{r, fig.width = 2.5, fig.height = 2}
+## Pre-vaccine IgA vs DMM1 at 2mo
+dats = as.data.table(pre_pdmm1_2mo, keep.rownames=TRUE)
+dats[,Significance := gsub('\\*\\*+','\\*', signif)] ## single-star significance level
+
+pre_odds_vdmm1 = ggplot(data = dats) +
+    ## render points
+    geom_point(aes(x = gsub('cs.DMM','cs-GCT', rn), y = coef, color = Significance), size = 2) +
+    
+    ## add in error bars
+    geom_errorbar(aes(x = gsub('cs.DMM','cs-GCT', rn), ymax = coef + 2*se, ymin = coef - 2*se), width = 0.15) +
+    
+    ## color scale for significance
+    scale_color_signif + 
+    ylab('log(OR)') +
+    xlab('') +
+    theme_bw() +
+    ggtitle('Multinomial pre-RV1 Iga (M2)') +
+    theme(plot.title = element_text(size=11)) +
+    geom_hline(yintercept = 0, linetype = 'dashed') +
+    theme(panel.grid = element_blank()
+        , legend.position = 'none'
+        , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    facet_grid(~'vs M2 cs-GCT1')
+
+
+plot(pre_odds_vdmm1)
+
+svglite('figures/odds-multinom-pre-iga.svg', width = 2.5, height = 2, fix_text_size = FALSE)
+    plot(pre_odds_vdmm1)
+dev.off()
+
+fwrite(dats, 'source-data/ed-fig4/pre-vaccine-iga-multinom.txt.xls', sep='\t')
+```
+
+```{r, fig.width = 2.5, fig.height = 5}
+## Pre-vaccine IgA vs DMM6 at NB
+dats = as.data.table(post_pdmm6_NB, keep.rownames=TRUE)
+dats[,Significance := gsub('\\*\\*+','\\*', signif)] ## single-star significance level
+
+post_odds_vdmm6 = ggplot(data = dats) +
+    ## render points
+    geom_point(aes(x = gsub('cs.DMM','cs-GCT', rn), y = coef, color = Significance), size = 2) +
+    
+    ## add in error bars
+    geom_errorbar(aes(x = gsub('cs.DMM','cs-GCT', rn), ymax = coef + 2*se, ymin = coef - 2*se), width = 0.15) +
+    
+    ## color scale for significance
+    scale_color_signif + 
+    ylab('log(OR)') +
+    xlab('') +
+    ggtitle('Multinomial post-RV1 IgA') +
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) +
+    geom_hline(yintercept = 0, linetype = 'dashed') +
+    theme(panel.grid = element_blank()
+        , legend.position = 'none'
+        #, legend.title.position = 'top'
+        , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    facet_grid(~'vs M1 cs-GCT6')
+
+plot(post_odds_vdmm6)
+
+## Pre-vaccine IgA vs DMM6 at NB
+dats = as.data.table(pre_pdmm6_NB, keep.rownames=TRUE)
+dats[,Significance := gsub('\\*\\*+','\\*', signif)] ## single-star significance level
+
+pre_odds_vdmm6 = ggplot(data = dats) +
+    ## render points
+    geom_point(aes(x = gsub('cs.DMM','cs-GCT', rn), y = coef, color = Significance), size = 2) +
+    
+    ## add in error bars
+    geom_errorbar(aes(x = gsub('cs.DMM','cs-GCT', rn), ymax = coef + 2*se, ymin = coef - 2*se), width = 0.15) +
+    
+    ## color scale for significance
+    scale_color_signif + 
+    ylab('log(OR)') +
+    xlab('') +
+    ggtitle('Multinomial pre-RV1 IgA') +
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) +
+    geom_hline(yintercept = 0, linetype = 'dashed') +
+    theme(panel.grid = element_blank()
+        , legend.position = 'none'
+        #, legend.title.position = 'top'
+        , axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    facet_grid(~'vs. M1 cs-GCT6')
+
+pdf(file = NULL)
+    pl = ggpubr::get_legend(pre_odds_vdmm6 + theme(legend.position = 'bottom', legend.title.position = 'top'))
+dev.off()
+
+odds_multinom_iga = plot_grid(pre_odds_vdmm6, post_odds_vdmm6, nrow = 2, rel_widths = c(1, 1), align = "v", axis = "l") %>% plot_grid(., pl, rel_heights = c(1, 0.2), nrow = 2)
+
+plot(odds_multinom_iga)
+
+svglite('figures/odds-multinom-iga.svg', width = 2.5, height = 5, fix_text_size = FALSE)
+    plot(odds_multinom_iga)
+dev.off()
+```
+
+## DMM-Adonis
+```{r}
+library('khroma')
+## Define palette for each timepoint
+
+nb_dmms = cs_dmm_data[,unique(NB)] %>% na.omit() %>% sort()
+nb_dmm_pal = (color("bright")(7))[1:length(nb_dmms)] %>% setNames(nb_dmms)
+nb_csgt_pal = nb_dmm_pal %>% setNames(gsub('cs.DMM','M1 cs-GCT', nb_dmms))
+
+## 50% transparent mix for light version
+nb_csgt_pal_light = nb_csgt_pal %>%
+    lapply(function(co) hex(mixcolor(alpha = 0.5, color1 = hex2RGB(co), color2 = hex2RGB('#FFFFFF')))) %>%
+    do.call('c',.)
+
+## 25% transparent mix for light version
+nb_csgt_pal_pale = nb_csgt_pal_light %>%
+    lapply(function(co) hex(mixcolor(alpha = 0.5, color1 = hex2RGB(co), color2 = hex2RGB('#FFFFFF')))) %>%
+    do.call('c',.)
+
+## Plot ordinations vs NB dmms function
+plot_nb_ordination_dmm = function(ord_data, permanova)
+{
+    ord_data[,csGCT := gsub('cs.DMM','M1 cs-GCT', NB)]
+
+    permanova = permanova %>% as.data.table(keep.rownames = TRUE)
+    
+    ord_data[,nbdmm.centroid.Axis.1 := median(Axis.1), by = .(csGCT)]
+    ord_data[,nbdmm.centroid.Axis.2 := median(Axis.2), by = .(csGCT)]
+    
+    ## Background ellipses
+    p1 = ggplot(data = ord_data) +
+        stat_ellipse(mapping = aes(fill = csGCT, x = Axis.1, y = Axis.2), geom = "polygon", alpha = 0.15)
+        
+    ## Add spiders
+    #for(dm in ord_data[,csGCT] %>% unique()) p1 = p1 +
+    #    geom_segment(data = ord_data[csGCT == dm,]
+    #               , mapping = aes(
+    #                   x = Axis.1, xend = nbdmm.centroid.Axis.1
+    #                 , y = Axis.2, yend = nbdmm.centroid.Axis.2
+    #                 , color = csGCT)
+    #               , alpha = 0.25
+    #               , size = 0.65)
+    
+    ## Add in points
+    p1 = p1 + geom_point(mapping = aes(
+                   x = Axis.1
+                 , y = Axis.2
+                 , color = csGCT)
+                 , size = 0.8)
+    
+    ## Centroids
+    for(dm in ord_data[,csGCT] %>% unique()) p1 = p1 +
+        geom_point(data = ord_data[csGCT == dm,][!duplicated(csGCT),]
+                 , mapping = aes(
+                      x = nbdmm.centroid.Axis.1
+                    , y = nbdmm.centroid.Axis.2
+                    , fill = csGCT)
+                 , color = neutral_gray
+                 , size = 2.5
+                 , shape = 21)
+    
+    ## Build pvals.
+    p.value = permanova[rn == 'NB', `Pr(>F)`]
+    f.stat = permanova[rn == 'NB', `F`] %>% round(3)
+    pval = ifelse(p.value < 0.01, '<0.01', paste0('= ', as.character(signif(p.value, digits=3))))
+    plabs =  paste0('P ', pval, '\nF = ', f.stat)
+    
+    ## annotate
+    p1 = p1 + annotate(geom = 'text'
+                 , x = ord_data[,(min(Axis.1) %>% abs())] * ord_data[,min(Axis.1) %>% sign()]*1.2
+                 , y = ord_data[,(max(Axis.2) %>% abs())] * ord_data[,max(Axis.2) %>% sign()]*1.1
+                 , label = plabs
+                 , hjust = 0, vjust = 1
+                 , lineheight = 0.95
+                 , color = neutral_gray)
+
+    ## Theme elements
+    p1 = p1 +
+        scale_color_manual(values = nb_csgt_pal, breaks = names(nb_csgt_pal)) +
+        scale_fill_manual(values = nb_csgt_pal, breaks = names(nb_csgt_pal)) +
+        facet_grid(~relabely[visit]) +
+        
+        xlab('Axis1') +
+        ylab('Axis2') +
+        theme_bw() + 
+    theme(plot.title = element_text(size=11)) +
+        theme(legend.position = 'none', panel.grid = element_blank())
+    
+    ## Change facet label colors
+    pdf(file = NULL)
+    g = ggplot_gtable(ggplot_build(p1))
+    dev.off()
+    stripr <- which(grepl('strip-t', g$layout$name))
+    fills <- col_pal_visit_light[intersect(names(col_pal_visit_light), ord_data[,visit])]
+    
+    k = 1
+    for (i in stripr) {
+      j <- which(grepl('rect', g$grobs[[i]]$grobs[[1]]$childrenOrder))
+      g$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+      k = k+1
+    }
+    
+    pl1 = ggplotify::as.ggplot(g)
+
+    return(pl1)
+}
+
+## Plot ordinations vs NB dmms legend
+plot_nb_ordination_dmm_leg = function(ord_data)
+{
+    ord_data[,csGCT := gsub('cs.DMM','M1 cs-GCT', NB)]
+    ord_data[,nbdmm.centroid.Axis.1 := median(Axis.1), by = .(csGCT)]
+    ord_data[,nbdmm.centroid.Axis.2 := median(Axis.2), by = .(csGCT)]
+    
+    ## Centroids
+    for(dm in ord_data[,csGCT] %>% unique()) p1 = p1 +
+        geom_point(data = ord_data[csGCT == dm,][!duplicated(csGCT),]
+                 , mapping = aes(
+                      x = nbdmm.centroid.Axis.1
+                    , y = nbdmm.centroid.Axis.2
+                    , fill = csGCT)
+                 , color = neutral_gray
+                 , size = 2.5
+                 , shape = 21)
+    ## Theme elements
+    p1 = p1 +
+        scale_fill_manual(values = nb_csgt_pal, breaks = names(nb_csgt_pal)) +
+        xlab('Axis1') +
+        ylab('Axis2') +
+        theme_bw() + 
+    theme(plot.title = element_text(size=11)) +
+        theme(legend.position = 'bottom', legend.title.position = 'top', panel.grid = element_blank())
+    return(p1)
+}
+
+```
+
+```{r, fig.width = 5, fig.height = 3.5}
+## Iterate adonis over visit number
+aitch_dmm_data_NB = visits %>%
+    lapply(
+function(v)
+{
+    thisvisitsams = metadata[visit == v 
+                             & enrollment_id %in% alphadivdmm[!is.na(NB), enrollment_id]
+                            , sample_name] %>%
+        intersect(colnames(rarecounts))
+    
+    thisvisitcounts = spp_clr[thisvisitsams,]
+    
+    thisvisitmeta = setkey(alphadivdmm, enrollment_id)[metadata[thisvisitsams, enrollment_id],] %>%
+        setkey(sample_name)
+    
+    thisvisitmeta$visit = v
+
+    v_euclidean = vegdist(thisvisitcounts, method = 'euclidean')
+    
+    ## Draw PCoA
+    v_euclidean_pcoa_ord = pcoa(v_euclidean)
+    v_euclidean_pcoa_coords = v_euclidean_pcoa_ord$vectors
+    v_euclidean_pcoa_data = thisvisitmeta %>% cbind(v_euclidean_pcoa_coords)
+    return(v_euclidean_pcoa_data)
+}) %>% setNames(visits)
+
+## NB
+permanova = aitch_adonis_list_NB[[1]][[1]]
+p_nb_nb = plot_nb_ordination_dmm(aitch_dmm_data_NB[[1]], permanova)
+
+## 2mo
+permanova = aitch_adonis_list_NB[[2]][[1]]
+p_nb_2mo = plot_nb_ordination_dmm(aitch_dmm_data_NB[[2]], permanova)
+
+## 4mo
+permanova = aitch_adonis_list_NB[[3]][[1]]
+p_nb_4mo = plot_nb_ordination_dmm(aitch_dmm_data_NB[[3]], permanova)
+
+pdf(file = NULL)
+    legend = ggpubr::get_legend(plot_nb_ordination_dmm_leg(aitch_dmm_data_NB[[1]]))
+dev.off()
+
+fig4e = plot_grid(p_nb_2mo, p_nb_4mo, labels = c('A',''), ncol = 2) %>% plot_grid(., legend, rel_heights = c(1, 0.4), nrow = 2)
+
+plot(fig4e)
+```
+
+
+## Render figure 4
+```{r, fig.width = 5, fig.height = 8}
+
+## Sero/shedding odds from multinom plot as figure 4 A and B
+fig4ab = odds_multinom
+svglite('figures/figure4-AB.svg', width = 5, height = 2.5, fix_text_size = FALSE)
+    plot(fig4ab)
+dev.off()
+
+## DMM differences as panels C and D
+fig4cd = plot_grid(taxon_bars_nb_sel, '', rel_heights = c(2.8, 0.7), ncol = 1) %>%
+plot_grid(., dmm6_vs_dmms_coefplot, rel_widths = c(1,0.45), ncol = 2)
+
+svglite('figures/figure4-CD.svg', width = 9.8, height = 3.5, fix_text_size = FALSE)
+    plot(fig4cd)
+dev.off()
+
+## Panel E (print this to a file, but the final version doesn't use it.)
+svglite('figures/figure4-E.svg', width = 5, height = 3.5, fix_text_size = FALSE)
+    plot(fig4e)
+dev.off()
+
+plot_grid(fig4cd, fig4ab, fig4e, nrow = 3)
+```
+
+```{r, fig.width = 6.5, fig.height = 5}
+pg = plot_grid(taxon_bars_2mo_all,
+taxon_bars_4mo_all, ncol = 1, labels = c('A','B'))
+
+pg2 = plot_grid(taxon_bars_nb_all, vs_dmm3_coefplot, vs_dmm6_coefplot, labels = c('A','B','C'))
+
+svglite('figures/extended-data-taxon-barplots-other-timepoints.svg', width = 6.5, height = 5, fix_text_size = FALSE)
+    plot(pg)
+dev.off()
+```
+
+# Figure 5: Calprotectin
+```{r}
+library('ggplotify')
+library('ggsignif')
+load('calprotectin.Rdata')
+```
+
+## PCR M1
+```{r, fig.width = 2, fig.height = 2.5}
+## Calprotectin boxplots vs shedding
+p1 = ggplot(data = cal_md[!is.na(rota_stool_pcr),]) +
+    scale_color_pcr_outer +
+    scale_fill_pcr_pale +
+    geom_boxplot(outlier.shape = NA
+         , aes(x = rota_stool_pcr
+         , y = cal_2wk
+         , color = rota_stool_pcr
+         , fill = rota_stool_pcr)) +
+    geom_beeswarm(
+          aes(x = rota_stool_pcr
+         , y = cal_2wk
+         , color = rota_stool_pcr
+         , fill = rota_stool_pcr), size = 0.75) +
+    scale_x_discrete(breaks = cal_md[,rota_stool_pcr] %>% factor() %>% levels()
+                   , labels = c('-','+')) + 
+    
+    ggpubr::geom_signif(
+        data = data.frame(xmx = 'Negative', xmn = 'Positive', label = 'P = 0.043 *', yp = 12),
+        mapping = aes(xmin = xmn, xmax = xmx, annotations = label, y_position = yp),
+        textsize = 3, vjust = -0.2,
+        manual = TRUE,
+        inherit.aes = FALSE
+    ) +
+    
+    ylim(c(NA,12.5)) +
+    
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) +
+    xlab('RV1 shedding, M4') +
+    ylab('log2-Calprotectin, M1') +
+    #theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    #theme(legend.position = 'bottom', legend.title.position = 'top') +
+    theme(legend.position = 'none') +
+    theme(panel.spacing = unit(0, "lines")) +
+    theme(panel.grid = element_blank())
+
+calprotectin_pcr_m1_boxplots = p1
+plot(calprotectin_pcr_m1_boxplots)
+```
+
+## PCR M2
+```{r, fig.width = 2, fig.height = 2.5}
+## Calprotectin boxplots vs shedding
+p1 = ggplot(data = cal_md[!is.na(rota_stool_pcr),]) +
+    scale_color_pcr_outer +
+    scale_fill_pcr_pale +
+    geom_boxplot(outlier.shape = NA
+         , aes(x = rota_stool_pcr
+         , y = cal_2mo
+         , color = rota_stool_pcr
+         , fill = rota_stool_pcr)) +
+    geom_beeswarm(
+          aes(x = rota_stool_pcr
+         , y = cal_2mo
+         , color = rota_stool_pcr
+         , fill = rota_stool_pcr), size = 0.75) +
+    scale_x_discrete(breaks = cal_md[,rota_stool_pcr] %>% factor() %>% levels()
+                   , labels = c('-','+')) + 
+    
+    ggpubr::geom_signif(
+        data = data.frame(xmx = 'Negative', xmn = 'Positive', label = 'P = 0.50', yp = 12),
+        mapping = aes(xmin = xmn, xmax = xmx, annotations = label, y_position = yp),
+        textsize = 3, vjust = -0.2,
+        manual = TRUE,
+        inherit.aes = FALSE
+    ) +
+    
+    ylim(c(NA,12.5)) +
+    
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) +
+    xlab('RV1 shedding, M4') +
+    ylab('log2-Calprotectin, M2') +
+    #theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    #theme(legend.position = 'bottom', legend.title.position = 'top') +
+    theme(legend.position = 'none') +
+    theme(panel.spacing = unit(0, "lines")) +
+    theme(panel.grid = element_blank())
+
+calprotectin_pcr_m2_boxplots = p1
+plot(calprotectin_pcr_m2_boxplots)
+```
+
+## Sero M1
+```{r, fig.width = 2, fig.height = 2.5}
+## Calprotectin boxplots vs sero, m1
+p1 = ggplot(data = cal_md[!is.na(Seroconverted),]) +
+    scale_color_sero_outer +
+    scale_fill_sero_pale +
+    geom_boxplot(outlier.shape = NA
+         , aes(x = Seroconverted
+         , y = cal_2wk
+         , color = Seroconverted
+         , fill = Seroconverted)) +
+    geom_beeswarm(
+          aes(x = Seroconverted
+         , y = cal_2wk
+         , color = Seroconverted
+         , fill = Seroconverted), size = 0.75) +
+    scale_x_discrete(breaks = cal_md[,Seroconverted] %>% factor() %>% levels()
+                   , labels = c('NR','R')) + 
+    
+    ggpubr::geom_signif(
+        data = data.frame(xmx = 'Non-responder', xmn = 'Responder', label = 'P = 0.86', yp = 12),
+        mapping = aes(xmin = xmn, xmax = xmx, annotations = label, y_position = yp),
+        textsize = 3, vjust = -0.2,
+        manual = TRUE,
+        inherit.aes = FALSE
+    ) +
+    
+    ylim(c(NA,12.5)) +
+    
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) +
+    xlab('RV1 Seroconversion') +
+    ylab('log2-Calprotectin, M1') +
+    #theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    theme(axis.text.x = element_text()) +
+    #theme(legend.position = 'bottom', legend.title.position = 'top') +
+    theme(legend.position = 'none') +
+    theme(panel.spacing = unit(0, "lines")) +
+    theme(panel.grid = element_blank())
+
+calprotectin_sero_m1_boxplots = p1
+plot(calprotectin_sero_m1_boxplots)
+```
+
+## Sero M2
+```{r, fig.width = 2, fig.height = 2.5}
+## Calprotectin boxplots vs shedding
+p1 = ggplot(data = cal_md[!is.na(Seroconverted),]) +
+    scale_color_sero_outer +
+    scale_fill_sero_pale +
+    geom_boxplot(outlier.shape = NA
+         , aes(x = Seroconverted
+         , y = cal_2mo
+         , color = Seroconverted
+         , fill = Seroconverted)) +
+    geom_beeswarm(
+          aes(x = Seroconverted
+         , y = cal_2mo
+         , color = Seroconverted
+         , fill = Seroconverted), size = 0.75) +
+    scale_x_discrete(breaks = cal_md[,Seroconverted] %>% factor() %>% levels()
+                   , labels = c('NR','R')) + 
+    
+    ggpubr::geom_signif(
+        data = data.frame(xmx = 'Non-responder', xmn = 'Responder', label = 'P = 0.014 *', yp = 12),
+        mapping = aes(xmin = xmn, xmax = xmx, annotations = label, y_position = yp),
+        textsize = 3, vjust = -0.2,
+        manual = TRUE,
+        inherit.aes = FALSE
+    ) +
+    
+    ylim(c(NA,12.5)) +
+    
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) +
+    xlab('RV1 Seroconversion') +
+    ylab('log2-Calprotectin, M2') +
+    #theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    theme(axis.text.x = element_text()) +
+    #theme(legend.position = 'bottom', legend.title.position = 'top') +
+    theme(legend.position = 'none') +
+    theme(panel.spacing = unit(0, "lines")) +
+    theme(panel.grid = element_blank())
+
+calprotectin_sero_m2_boxplots = p1
+plot(calprotectin_sero_m2_boxplots)
+```
+
+```{r, fig.width = 4, fig.height = 5}
+calprotectin_pg = plot_grid(calprotectin_pcr_m1_boxplots
+                          , calprotectin_pcr_m2_boxplots
+                          , calprotectin_sero_m1_boxplots
+                          , calprotectin_sero_m2_boxplots
+                          , labels = c('A','B','C','D'))
+
+plot(calprotectin_pg)
+
+svglite('figures/calprotectin-extended-data.svg', width = 4, height = 5)
+    plot(calprotectin_pg)
+dev.off()
+
+cal_md[,.(Seroconverted, rota_stool_pcr, cal_m1 = cal_2wk, cal_m2 = cal_2mo, csGCT_m1 = NB)] %>% 
+    fwrite('source-data/fig5/calprotectin-data.txt.xls', sep = '\t')
+```
+
+```{r, fig.width = 2.5, fig.height = 2.5}
+feats = fread('.tmp.Maaslin2_cal2wk_NB/features/filtered_data_norm.tsv', sep = '\t', header=TRUE)
+bifidos_nb = feats[,Bifidobacterium.longum] %>% setNames(feats[,feature])
+names(bifidos_nb) = filtered_metadata[names(bifidos_nb), enrollment_id]
+
+cal_bif_nb = cal_md[names(bifidos_nb),] %>% cbind(bifidos_nb)
+
+bifidos_nb_plot = ggplot(data = cal_bif_nb[!is.na(country),], aes(x = cal_2wk, y = asin(sqrt(bifidos_nb)))) + geom_point(color = '#4477AA', size = 0.75) + geom_smooth(method = 'lm') +
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) +
+    ylab('asin(sqrt(B. longum)), M1') +
+    xlab('log2-Calprotectin, M1') +
+    theme(panel.grid = element_blank())
+
+plot(bifidos_nb_plot)
+
+cal_bif_nb[!is.na(country), .(m1_cal = cal_2wk, ast_bifidos  = asin(sqrt(bifidos_nb)))] %>% 
+    fwrite('source-data/fig5/bifidos-data.txt.xls', sep = '\t')
+
+```
+
+```{r, fig.width = 4, fig.height = 2.5}
+library('DescTools')
+cal_md[,csGCT := gsub('cs.DMM','cs-GCT', NB)]
+
+z = DunnTest(cal_md[!is.na(NB),cal_2wk], cal_md[!is.na(NB),NB], method = 'BH')
+
+ps = z$pmat %>% reshape2::melt() %>% as.data.table()
+
+sigs = ps[value < 0.1,]
+
+sigs[,pv:= round(value, 3)]
+sigs[,label := paste0('P = ', pv, '*')]
+
+p3 = ggplot(data = cal_md[!is.na(csGCT),]) +
+        #scale_color_manual(values = nb_csgt_pal, breaks = names(nb_csgt_pal)) +
+        #scale_fill_manual(values = nb_csgt_pal_pale, breaks = names(nb_csgt_pal)) +
+        #facet_grid(~relabely['NB']) +
+   
+    geom_boxplot(aes(x = csGCT, y = cal_2wk)
+               , outlier.shape = NA, color = neutral_gray
+               , fill = neutral_gray_pale) +
+    geom_beeswarm(aes(x = csGCT, y = cal_2wk), size = 0.75, color = neutral_gray) +
+    
+    ggpubr::geom_signif(
+        data = data.frame(xmx = 'cs-GCT1', xmn = 'cs-GCT2', label = 'P = 0.038', yp = 12),
+        mapping = aes(xmin = xmn, xmax = xmx, annotations = label, y_position = yp),
+        textsize = 3, vjust = -0.2,
+        manual = TRUE,
+        inherit.aes = FALSE
+    ) +
+    
+    theme_bw() + 
+    
+    ylim(c(NA, 12.5)) +
+    
+    theme(plot.title = element_text(size=11)) +
+    xlab('M1 cross-sectional Gut Community Type (cs-GCT)') +
+    ylab('log2-Calprotectin, M1') +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    theme(legend.position = 'none') +
+    theme(panel.grid = element_blank())
+
+calprotectin_country_dmm_plots = p3
+
+## print
+plot(calprotectin_country_dmm_plots)
+svglite('figures/calrprotectin-dmms.svg', width = 4, height = 2.5, fix_text_size = FALSE)
+    plot(calprotectin_country_dmm_plots)
+dev.off()
+
+
+```
+
+## Render figure 5
+```{r}
+
+## I ended up taking this plot apart to make figure 5.
+gridplot = plot_grid(calprotectin_pcr_m1_boxplots, bifidos_nb_plot, ncol = 2, labels = c('A','B')) %>%
+    list(.,calprotectin_country_dmm_plots) %>%
+    plot_grid(plotlist = ., nrow = 2, rel_heights = c(0.8, 1), labels = c('','C'))
+
+svglite('figures/figure-5.svg', width = 6, height = 6, fix_text_size = FALSE)
+    plot(gridplot)
+dev.off()
+
+
+```
+
+# ED-Figure 6:  Machine learning
+```{r}
+## Load in the ML dataset
+load('rota-lgbm.Rdata')
+```
+
+```{r fig.width = 6, fig.height = 6.5}
+
+
+get_xtabs = function(model, data, truth)
+{
+    truth = truth %>% unlist() %>% unname() %>% make.names() %>% factor()
+    data = data[!is.na(truth),]
+    predictions = predict(model, data, type = 'prob')
+    colnames(predictions) = make.names(colnames(predictions))
+    
+    predictions$.pred_class = colnames(predictions)[predictions %>% apply(1, which.max)] %>%
+        gsub('^\\.pred_','',.) %>%
+        factor(levels = levels(truth))
+    
+    xtab = table(predictions$.pred_class, truth)
+    return(xtab)
+}
+
+library('tidymodels')
+dependentvar = 'Seroconverted'
+
+## NB timepoint
+test_curves = get_roc_pr_curves(model = nb_bfmodl
+                  , data = nb_data_test
+                  , truth = nb_data_test[,dependentvar]
+                  , label = 'holdout')
+nb_curves = test_curves
+
+nb_roc_plot = ggplot() +
+  geom_line(data = test_curves[[1]], aes(x = 1 - specificity, y = sensitivity), color = '#4477AA', size = 0.75) +
+  geom_abline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1
+    ) +
+    facet_grid(~'M1') + 
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) + 
+    theme(panel.grid = element_blank()) +
+    theme(strip.background = element_rect(fill = col_pal_visit_light['NB']))
+
+noskill_pr_test = nb_data_test[,dependentvar] %>% unlist() %>% table() %>% (function(x) x[1] / (x[2] + x[1]))
+nb_pr_plot = ggplot() +
+  geom_line(data = test_curves[[2]], aes(x = recall, y = precision), color = '#44AA99', size = 1) +
+  geom_hline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1,
+        yintercept = noskill_pr_test
+    ) +
+    facet_grid(~'M1') + 
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) + 
+    theme(panel.grid = element_blank()) +
+    theme(strip.background = element_rect(fill = col_pal_visit_light['NB']))
+
+nb_test_xtabs = get_xtabs(model = nb_bfmodl
+                  , data = nb_data_test
+                  , truth = nb_data_test[,dependentvar])
+rownames(nb_test_xtabs) = abbreviate.response(rownames(nb_test_xtabs))
+colnames(nb_test_xtabs) = abbreviate.response(colnames(nb_test_xtabs))
+nb_xtab_plot = ggtexttable(nb_test_xtabs)
+
+## M2 timepoint
+test_curves = get_roc_pr_curves(model = m2_bfmodl
+                  , data = m2_data_test
+                  , truth = m2_data_test[,dependentvar]
+                  , label = 'holdout')
+m2_curves = test_curves
+
+
+m2_test_xtabs = get_xtabs(model = m2_bfmodl
+                  , data = m2_data_test
+                  , truth = m2_data_test[,dependentvar])
+rownames(m2_test_xtabs) = abbreviate.response(rownames(m2_test_xtabs))
+colnames(m2_test_xtabs) = abbreviate.response(colnames(m2_test_xtabs))
+m2_xtab_plot = ggtexttable(m2_test_xtabs)
+
+m2_roc_plot = ggplot() +
+  geom_line(data = test_curves[[1]], aes(x = 1 - specificity, y = sensitivity), color = '#4477AA', size = 0.75) +
+  geom_abline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1
+    ) +
+    facet_grid(~'M2') + 
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) + 
+    theme(panel.grid = element_blank()) +
+    theme(strip.background = element_rect(fill = col_pal_visit_light['2mo']))
+
+noskill_pr_test = m2_data_test[,dependentvar] %>% unlist() %>% table() %>% (function(x) x[1] / (x[2] + x[1]))
+m2_pr_plot = ggplot() +
+  geom_line(data = test_curves[[2]], aes(x = recall, y = precision), color = '#44AA99', size = 1) +
+  geom_hline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1,
+        yintercept = noskill_pr_test
+    ) +
+    facet_grid(~'M2') + 
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) + 
+    theme(panel.grid = element_blank()) +
+    theme(strip.background = element_rect(fill = col_pal_visit_light['2mo']))
+
+
+## M4 timepoint
+test_curves = get_roc_pr_curves(model = m4_bfmodl
+                  , data = m4_data_test
+                  , truth = m4_data_test[,dependentvar]
+                  , label = 'holdout')
+m4_curves = test_curves
+
+
+m4_test_xtabs = get_xtabs(model = m4_bfmodl
+                  , data = m4_data_test
+                  , truth = m4_data_test[,dependentvar])
+
+rownames(m4_test_xtabs) = abbreviate.response(rownames(m4_test_xtabs))
+colnames(m4_test_xtabs) = abbreviate.response(colnames(m4_test_xtabs))
+m4_xtab_plot = ggtexttable(m4_test_xtabs)
+
+m4_roc_plot = ggplot() +
+  geom_line(data = test_curves[[1]], aes(x = 1 - specificity, y = sensitivity), color = '#4477AA', size = 0.75) +
+  geom_abline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1
+    ) +
+    facet_grid(~'M4') + 
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) + 
+    theme(panel.grid = element_blank()) +
+    theme(strip.background = element_rect(fill = col_pal_visit_light['4mo']))
+
+noskill_pr_test = m4_data_test[,dependentvar] %>% unlist() %>% table() %>% (function(x) x[1] / (x[2] + x[1]))
+m4_pr_plot = ggplot() +
+  geom_line(data = test_curves[[2]], aes(x = recall, y = precision), color = '#44AA99', size = 1) +
+  geom_hline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1,
+        yintercept = noskill_pr_test
+    ) +
+    facet_grid(~'M4') + 
+    theme_bw() + 
+    theme(plot.title = element_text(size=11)) + 
+    theme(panel.grid = element_blank()) +
+    theme(strip.background = element_rect(fill = col_pal_visit_light['4mo']))
+
+nb_row = plot_grid(nb_roc_plot, nb_pr_plot, nb_xtab_plot, rel_widths = c(1, 1, 0.5), nrow = 1)
+m2_row = plot_grid(m2_roc_plot, m2_pr_plot, m2_xtab_plot, rel_widths = c(1, 1, 0.5), nrow = 1)
+m4_row = plot_grid(m4_roc_plot, m4_pr_plot, m4_xtab_plot, rel_widths = c(1, 1, 0.5), nrow = 1)
+
+plot_grid(nb_row, m2_row, m4_row, labels = c('A','B','C'), ncol = 1)
+
+saveRDS(nb_bfmodl, file = 'm1-lgbm.rds')
+saveRDS(m2_bfmodl, file = 'm2-lgbm.rds')
+saveRDS(m4_bfmodl, file = 'm4-lgbm.rds')
+
+```
+
+## Render figure 6
+```{r}
+p6 = plot_grid(nb_row, m2_row, m4_row, labels = c('A','B','C'), ncol = 1)
+svglite('figures/figure-6.svg', width = 6, height = 6.5, fix_text_size = FALSE)
+    plot(p6)
+dev.off()
+
+## Save curves to file
+
+roc_curves = rbind(
+    cbind(nb_curves[[1]], t = 'm1'),
+    cbind(m2_curves[[1]], t = 'm2'),
+    cbind(m4_curves[[1]], t = 'm4')
+)
+
+pr_curves = rbind(
+    cbind(nb_curves[[2]], t = 'm1'),
+    cbind(m2_curves[[2]], t = 'm2'),
+    cbind(m4_curves[[2]], t = 'm4')
+)
+
+fwrite(roc_curves, "source-data/ed-fig6/roc-curves.tsv.xls", sep = '\t')
+fwrite(pr_curves, "source-data/ed-fig6/pr-curves.tsv.xls", sep = '\t')
+
+```
+
+# Tables
+```{r}
+cal_md %>% setkey(enrollment_id)
+
+## OGU matrix and taxonomy
+cbind(taxonomy, countmatrix) %>% fwrite('tables/ogu-matrix.txt.xls', sep = '\t')
+
+metadata[,include := FALSE]
+metadata[!is.na(Seroconverted) & sample_name %in% colnames(goodcounts),include := TRUE]
+
+## Sample metadata
+metadata %>%
+    cbind(.,cal_md[metadata[,enrollment_id],.(cal_2wk, cal_2mo)]) %>%
+    fwrite('tables/sample_metadata.txt.xls', sep = '\t')
+
+```
+
+# Suppfigs
+```{r, fig.width = 6, fig.height = 6}
+
+svglite('figures/suppfig-alphadiv-regressions.svg', width = 6, height = 6, fix_text_size = FALSE)
+    norm_plot(alphadivnona[,SR], transform = 'log', label = 'OGU Richness')
+dev.off()
+
+norm_plot(alphadivnona[,EMR], transform = 'log', label = 'EM Richness')  
+
+norm_plot(alphadivnona[,PD], transform = 'log', label = "Faith's PD")  
+
+norm_plot(alphadivnona[,simpson], transform = 'logit', label = "Simpson")  
+
+norm_plot(alphadivnona[,shannon], transform = 'log', label = "Shannon")  
+
+```
+
+```{r}
+sessionInfo()
+
+```

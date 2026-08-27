@@ -1,0 +1,1502 @@
+---
+title: "ROTA Metagenomics: Machine learning"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+    number_sections: true
+    theme: lumen
+---
+# Summary
+This document contains the scripts used to run & tune lightGBM models.
+
+# Setup
+In this section are the chunks that call libraries into the environment and intitalize the dataset.
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width=6, fig.height=5)
+```
+
+```{r libraries}
+## override library function to silence all package messages.
+silence = function(x) suppressPackageStartupMessages(suppressWarnings({invisible({capture.output(x)})}))
+library = function(...) silence({base::library(...)})
+
+library('data.table')
+library('rlang')
+library('lightgbm')
+library('bonsai')
+library('themis')
+library('yardstick')
+library('tidymodels')
+library('tidyverse')
+library('ggplot2')
+library('kernelshap')
+library('shapviz')
+library('caret')
+library('DescTools')
+library('pROC')
+library('cowplot')
+library('dials')
+
+load(file="calprotectin.RData")
+
+evaluate.model = function(truth, prediction)
+{
+    cm = table(truth, prediction)
+    
+    # Evaluation Metrics
+    n = sum(cm) # number of instances
+    nc = nrow(cm) # number of classes
+    diag = diag(cm) # number of correctly classified instances per class 
+    rowsums = apply(cm, 1, sum) # number of instances per class
+    colsums = apply(cm, 2, sum) # number of predictions per class
+    p = rowsums / n # distribution of instances over the actual classes
+    q = colsums / n # distribution of instances over the predicted classes
+    accuracy = sum(diag) / n 
+    message(paste0("Overall accuracy of the model is: ", accuracy) %>% message())  
+    precision = diag / colsums 
+    recall = diag / rowsums 
+    f1 = 2 * precision * recall / (precision + recall) 
+    metrics = data.table(accuracy = c(accuracy[1], NA %>% rep(nc-1))
+                        , precision
+                        , recall
+                        , f1
+                        )
+    
+    list(confusion.matrix = cm, metrics)
+}
+
+get_roc_pr_curves = function(model, data, truth, strata = NULL, label = NULL)
+{
+    truth = truth %>% unlist() %>% unname() %>% make.names() %>% factor()
+    data = data[!is.na(truth),]
+    predictions = predict(model, data, type = 'prob')
+    colnames(predictions) = make.names(colnames(predictions))
+    
+    predictions$.pred_class = colnames(predictions)[predictions %>% apply(1, which.max)] %>%
+        gsub('^\\.pred_','',.) %>%
+        factor(levels = levels(truth))
+    
+    if(ncol(predictions) == 3)
+    {
+        predictions$.truth = truth
+        predictions$.prob = 1 - (predictions[,colnames(predictions)[2]] %>% unlist())
+        
+        if(is.null(strata))
+        {
+            ROC = roc_curve(data = predictions, '.prob', truth = .truth)
+            PR = pr_curve(data = predictions, '.prob', truth = .truth)
+            
+            ROC$dataset = ''
+            PR$dataset = ''
+            print(evaluate.model(predictions$.pred_class, predictions$.truth))
+        } else {
+            ROC = lapply(data[,strata] %>% unlist() %>% unique(),
+            function(st)
+            {
+                stdata = data[data[,strata] == st,]
+                stpred = predictions[data[,strata] == st,]
+                
+                classobs = stpred[,'.truth'] %>% unlist() %>% unique() %>% length()
+                if(classobs == 1)
+                {
+                    warning('Only one class observed in truth.')
+                    return(NULL)
+                }
+                
+                stROC = roc_curve(data = stpred, '.prob', truth = .truth)
+                stROC$dataset = st
+                
+                return(stROC)
+            }) %>% do.call('rbind', .)
+            
+            PR = lapply(data[,strata] %>% unlist() %>% unique(),
+            function(st)
+            {
+                stdata = data[data[,strata] == st,]
+                stpred = predictions[data[,strata] == st,]
+                
+                classobs = stpred[,'.truth'] %>% unlist() %>% unique() %>% length()
+                if(classobs == 1)
+                {
+                    warning('Only one class observed in truth.')
+                    return(NULL)
+                }
+                
+                stPR = pr_curve(data = stpred, '.prob', truth = .truth)
+                stPR$dataset = st
+                
+                return(stPR)
+            }) %>% do.call('rbind', .)
+        }
+    } else {
+        ROC = NULL
+        PR = NULL
+    }
+    ROC$dataset = paste0(ROC$dataset %>% unlist(), '.', label)
+    PR$dataset = paste0(PR$dataset %>% unlist(), '.', label)
+    return(list(ROC, PR))
+}
+
+get_xtabs = function(model, data, truth)
+{
+    truth = truth %>% unlist() %>% unname() %>% make.names() %>% factor()
+    data = data[!is.na(truth),]
+    predictions = predict(model, data, type = 'prob')
+    colnames(predictions) = make.names(colnames(predictions))
+    
+    predictions$.pred_class = colnames(predictions)[predictions %>% apply(1, which.max)] %>%
+        gsub('^\\.pred_','',.) %>%
+        factor(levels = levels(truth))
+    
+    xtab = table(predictions$.pred_class, truth)
+    return(xtab)
+}
+
+agglomerate = function(counts, taxonomy, rank)
+{
+    mcounts = reshape2::melt(counts) %>% as.data.table() %>% setkey(Var1)
+    mtax = taxonomy[mcounts,][,.(value = sum(value)), by = .(Var2, R = get(rank))]
+    
+    dtax = dcast(mtax, R ~ Var2, value.var = 'value')
+    aggmatrix = dtax[,-1] %>% as.matrix()
+    rownames(aggmatrix) = dtax[,R]
+    
+    return(aggmatrix)
+}
+
+
+min_prevalence = 0.05
+min_abundance = 0.01
+pseudocount = 1
+
+agglomerate = function(counts, taxonomy, rank)
+## Agglomerate function for large sample-sizes.
+## 1. Convert from wide to long
+## 2. Bind to taxonomy
+## 3. Sum counts within selected rank
+## 4. Convert from long back to wide, add zeroes back into the matrix & return.
+## Params:
+## counts = a count matrix, where columns are samples, to agglomerate.
+## taxonomy = a matrix or data frame where rows are OTUs, representing taxonomy
+## rank = One of the columns of the taxonomy matrix (a string) to agglomerate on
+## Returns:
+## A count matrix where columns are samples and rows are the rank of interest.
+{
+    mcounts = reshape2::melt(counts) %>% as.data.table() %>% setkey(Var1)
+    mtax = taxonomy[mcounts,][,.(value = sum(value)), by = .(Var2, R = get(rank))]
+    
+    dtax = data.table::dcast(mtax, R ~ Var2, value.var = 'value')
+    aggmatrix = dtax[,-1] %>% as.matrix()
+    rownames(aggmatrix) = dtax[,R]
+    
+    return(aggmatrix)
+}
+
+## Prevalence filter.
+## Params:
+## counts = a count matrix where samples are columns.
+## min_prevalence = minimum prevalence threshold (as a decimal).
+## Returns:
+# A filtered count matrix with rows in fewer samples than the threshold of
+# min_prevalence removed.
+prevalence = function(counts, min_prevalence)
+    counts[rowSums(counts > 0) > (ncol(counts)*min_prevalence),];
+
+## Abundance filter.
+## Params:
+## counts = a count matrix where samples are columns.
+## min_abundance = minimum abundance threshold (as a decimal).
+## Returns:
+## A filtered count matrix with samples at a lower abundance in any sample than
+## the threshold removed.
+abundance = function(counts, min_abundance)
+    counts[(rowSums(apply(counts, 2, function(x) x/sum(x)) >= min_abundance) > 0) %>% which(),];
+
+set.seed(42)
+```
+
+```{r Params}
+## lightGBM params
+lgb_ntrees = 500
+lgb_k = 5
+lgb_repeats = 1
+lgb_gridsize = 100
+
+## Generate train/test outer splits.
+train_proportion = 0.7
+min_abundance = 0.01
+min_prevalence = 0.05
+```
+
+```{r FilterData}
+## Bind alpha div data to filtered metadata.
+filtered_metadata[alphadivs, c(colnames(alphadivs)) := mget(colnames(alphadivs))]
+```
+
+# Predicting delivery mode at NB
+We're predicting delivery mode at NB because we should be able to in this cohort.
+Using LightGBM.
+```{r dvSplitData}
+## Variable names for configs
+dependentvar = 'delivery'
+indivar = 'enrollment_id'
+sampvar = 'sample_name'
+timevar = 'visit'
+timepoint = 'NB'
+covars = c(colnames(alphadivs)) %>% setdiff('rn')
+strata = c('country') ## stratify to ensure even coverage of countries in the training/testing split
+
+ttmd = filtered_metadata[get(timevar) == timepoint
+                , mget(c(sampvar, indivar, covars, dependentvar, strata))] %>% na.omit()
+
+train_indivs = ttmd[,sample(get(indivar), ceiling(.N*train_proportion)), by = c(strata)][,V1]
+test_indivs = setdiff(ttmd[,get(indivar)], train_indivs)
+train_samples = ttmd[get(indivar) %in% train_indivs, get(sampvar)]
+test_samples = ttmd[get(indivar) %in% test_indivs, get(sampvar)]
+```
+
+```{r dvTrainingSplit}
+## Training covariate data
+train_samples = ttmd[get(sampvar) %in% train_samples, get(sampvar)] ## Reorder according to the table.
+train_covars = ttmd[get(sampvar) %in% train_samples, mget(covars)]
+train_ids = ttmd[get(sampvar) %in% train_samples, mget(indivar)]
+train_counts = goodcounts[,train_samples] %>% apply(2, function(x) x / sum(x))
+
+## Response var
+train_response = ttmd[get(sampvar) %in% train_samples, mget(dependentvar)]
+
+## Agglomerate.
+ogu_train_counts = train_counts %>%
+    abundance(min_abundance) %>%
+    prevalence(min_prevalence) %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    as.matrix()
+
+spp_train_counts = train_counts %>%
+    agglomerate(taxonomy, 's') %>%
+    abundance(min_abundance) %>%
+    prevalence(min_prevalence) %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    rename_all(~ paste0('s__',.)) %>%
+    as.matrix()
+
+gen_train_counts = train_counts %>%
+    agglomerate(taxonomy, 'g') %>%
+    abundance(min_abundance) %>%
+    prevalence(min_prevalence) %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    rename_all(~ paste0('g__',.)) %>%
+    as.matrix()
+
+## Taxon-specific comps.
+ogu_train_comp = ogu_train_counts[,-union(ogu_train_counts %>% nearZeroVar()
+                                    , which(colSums(ogu_train_counts) == 0)
+                                    )]
+spp_train_comp = spp_train_counts[,-union(spp_train_counts %>% nearZeroVar()
+                                    , which(colSums(spp_train_counts) == 0)
+                                    )]
+gen_train_comp = gen_train_counts[,-union(gen_train_counts %>% nearZeroVar()
+                                    , which(colSums(gen_train_counts) == 0)
+                                    )]
+
+## Build training dataframe.
+dv_data_train = cbind(train_response, train_covars, gen_train_comp, spp_train_comp) %>% as_tibble()
+```
+
+```{r dvTestingSplit}
+## Training covariate data
+test_samples = ttmd[get(sampvar) %in% test_samples, get(sampvar)] ## Reorder according to the table.
+test_covars = ttmd[get(sampvar) %in% test_samples, mget(covars)]
+test_ids = ttmd[get(sampvar) %in% test_samples, mget(indivar)]
+test_counts = goodcounts[,test_samples] %>% apply(2, function(x) x / sum(x))
+
+## Response var
+test_response = ttmd[get(sampvar) %in% test_samples, mget(dependentvar)]
+
+## Agglomerate.
+ogu_test_counts = test_counts %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    dplyr::select(!!colnames(ogu_train_counts)) %>%
+    as.matrix()
+
+spp_test_counts = test_counts %>% agglomerate(taxonomy, 's') %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    rename_all(~ paste0('s__',.)) %>%
+    dplyr::select(!!colnames(spp_train_counts)) %>%
+    as.matrix()
+ 
+gen_test_counts = test_counts %>% agglomerate(taxonomy, 'g') %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    rename_all(~ paste0('g__',.)) %>%
+    dplyr::select(!!colnames(gen_train_counts)) %>%
+    as.matrix()
+
+## Taxon-specific comps.
+ogu_test_comp = ogu_test_counts[,colnames(ogu_train_comp)]
+spp_test_comp = spp_test_counts[,colnames(spp_train_comp)]
+gen_test_comp = gen_test_counts[,colnames(gen_train_comp)]
+
+## Build training dataframe.
+dv_data_test = cbind(test_response, test_covars, gen_test_comp, spp_test_comp) %>% as_tibble()
+selvars = c(covars, colnames(spp_train_comp), colnames(gen_train_comp))
+```
+
+```{r dvTuneParams}
+lgb_classifier = boost_tree(
+   trees = lgb_ntrees
+ , tree_depth = tune()
+ , min_n = tune()
+ , loss_reduction = tune()
+ , sample_size = tune()
+ , mtry = tune()
+ , learn_rate = tune()
+ ) %>%
+set_engine("lightgbm",
+           is_unbalance = TRUE,
+           #boosting = "dart",
+           print_every_n=10) %>%
+set_mode("classification")
+
+modl = lgb_classifier
+
+modl_formula = paste0(dependentvar, ' ~ .') %>% as.formula()
+modl_recipe = recipe(modl_formula, data = dv_data_train)
+
+modl_workflow = workflow() %>% 
+    add_model(modl) %>%
+    add_recipe(modl_recipe)
+
+print(modl_workflow)
+    
+modl_cvfolds = vfold_cv(dv_data_train, strata = dependentvar, v = lgb_k, repeats = lgb_repeats);
+
+## Make tuning grid.
+lgb_tune_grid = grid_latin_hypercube(
+   tree_depth()
+ , min_n()
+ , loss_reduction()
+ , sample_size = sample_prop()
+ , finalize(mtry(), dv_data_train)
+ , learn_rate()
+ #, alpha()
+ , size = lgb_gridsize
+ )
+    
+## Exec cross-validation of the model
+message('Running cross-validation of model...')
+delivery_lgb_res = tune_grid(
+  modl_workflow
+  , resamples = modl_cvfolds
+  , grid = lgb_tune_grid
+  , metric_set(yardstick::accuracy
+             , yardstick::brier_class
+             , yardstick::f_meas
+             , yardstick::pr_auc
+             , yardstick::kap
+             , yardstick::roc_auc
+             )
+  , control = control_grid(save_pred = TRUE, verbose = TRUE, save_workflow = TRUE)
+)
+
+```
+
+```{r dvFit}
+delivery_bfmodl = fit_best(delivery_lgb_res, metric = 'roc_auc')
+```
+
+```{r dvEvalModel}
+
+train_curves = get_roc_pr_curves(model = delivery_bfmodl
+                  , data = dv_data_train
+                  , truth = dv_data_train[,dependentvar]
+                  , label = 'training')
+
+## Eval holdout data
+test_curves = get_roc_pr_curves(model = delivery_bfmodl
+                  , data = dv_data_test
+                  , truth = dv_data_test[,dependentvar]
+                  , label = 'holdout')
+
+## Plor ROC-curves.
+train_roc_plot = ggplot() +
+  geom_line(data = train_curves[[1]], aes(x = 1 - specificity, y = sensitivity), color = '#34A6FF', size = 1) +
+  geom_abline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1
+    ) + theme_bw() + ggtitle('Training ROC Delivery NB')
+
+test_roc_plot = ggplot() +
+  geom_line(data = test_curves[[1]], aes(x = 1 - specificity, y = sensitivity), color = '#DD0534', size = 1) +
+  geom_abline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1
+    ) + theme_bw() + ggtitle('Holdout ROC Delivery NB')
+
+## Plot PR curves.
+noskill_pr_test = dv_data_test[,dependentvar] %>% unlist() %>% table() %>% (function(x) x[1] / (x[2] + x[1]))
+noskill_pr_train = dv_data_train[,dependentvar] %>% unlist() %>% table() %>% (function(x) x[1] / (x[2] + x[1]))
+
+train_pr_plot = ggplot() +
+  geom_line(data = train_curves[[2]], aes(x = recall, y = precision), color = '#34A6FF', size = 1) +
+  geom_hline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1,
+        yintercept = noskill_pr_train
+    ) + theme_bw() + ggtitle('Training PR Delivery NB')
+
+
+test_pr_plot = ggplot() +
+  geom_line(data = test_curves[[2]], aes(x = recall, y = precision), color = '#DD0534', size = 1) +
+  geom_hline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1,
+        yintercept = noskill_pr_test
+    ) + theme_bw() + ggtitle('Holdout PR Delivery NB')
+
+plot_grid(train_roc_plot, train_pr_plot, test_roc_plot, test_pr_plot)
+```
+
+```{r dvSHAPs}
+## Bind the data back together and get SHAPs for the full dataset.
+data_shap = dv_data_train %>% rbind(dv_data_test)
+
+shap_values = kernelshap(delivery_bfmodl, data_shap, bg_X = data_shap, type = "prob")
+sv = shapviz(shap_values, which_class = 1)
+
+sv_importance(sv, kind = "bee")
+
+sv_force(sv, row_id = 1)
+sv_waterfall(sv, row_id = 1)
+
+```
+
+# Predicting seroconversion at NB
+```{r nbSplitData}
+## Variable names for configs
+dependentvar = 'Seroconverted'
+indivar = 'enrollment_id'
+sampvar = 'sample_name'
+timevar = 'visit'
+timepoint = 'NB'
+covars = c(colnames(alphadivs)) %>% setdiff('rn')
+strata = c('country') ## stratify to ensure even coverage of countries in the training/testing split
+
+ttmd = filtered_metadata[get(timevar) == timepoint, mget(c(sampvar, indivar, covars, dependentvar, strata))] %>% na.omit()
+
+train_indivs = ttmd[,sample(get(indivar), ceiling(.N*train_proportion)), by = c(strata)][,V1]
+test_indivs = setdiff(ttmd[,get(indivar)], train_indivs)
+train_samples = ttmd[get(indivar) %in% train_indivs, get(sampvar)]
+test_samples = ttmd[get(indivar) %in% test_indivs, get(sampvar)]
+```
+
+```{r nbTrainingSplit}
+## Training covariate data
+train_samples = ttmd[get(sampvar) %in% train_samples, get(sampvar)] ## Reorder according to the table.
+train_covars = ttmd[get(sampvar) %in% train_samples, mget(covars)]
+train_ids = ttmd[get(sampvar) %in% train_samples, mget(indivar)]
+train_counts = goodcounts[,train_samples] %>% apply(2, function(x) x / sum(x))
+
+## Response var
+train_response = ttmd[get(sampvar) %in% train_samples, mget(dependentvar)]
+
+## Agglomerate.
+ogu_train_counts = train_counts %>%
+    abundance(min_abundance) %>%
+    prevalence(min_prevalence) %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    as.matrix()
+
+spp_train_counts = train_counts %>%
+    agglomerate(taxonomy, 's') %>%
+    abundance(min_abundance) %>%
+    prevalence(min_prevalence) %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    rename_all(~ paste0('s__',.)) %>%
+    as.matrix()
+
+gen_train_counts = train_counts %>%
+    agglomerate(taxonomy, 'g') %>%
+    abundance(min_abundance) %>%
+    prevalence(min_prevalence) %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    rename_all(~ paste0('g__',.)) %>%
+    as.matrix()
+
+## Taxon-specific comps.
+ogu_train_comp = ogu_train_counts[,-union(ogu_train_counts %>% nearZeroVar()
+                                    , which(colSums(ogu_train_counts) == 0)
+                                    )]
+spp_train_comp = spp_train_counts[,-union(spp_train_counts %>% nearZeroVar()
+                                    , which(colSums(spp_train_counts) == 0)
+                                    )]
+gen_train_comp = gen_train_counts[,-union(gen_train_counts %>% nearZeroVar()
+                                    , which(colSums(gen_train_counts) == 0)
+                                    )]
+
+## Build training dataframe.
+nb_data_train = cbind(train_response, train_covars, gen_train_comp, spp_train_comp) %>% as_tibble()
+```
+
+```{r nbTestingSplit}
+## Training covariate data
+test_samples = ttmd[get(sampvar) %in% test_samples, get(sampvar)] ## Reorder according to the table.
+test_covars = ttmd[get(sampvar) %in% test_samples, mget(covars)]
+test_ids = ttmd[get(sampvar) %in% test_samples, mget(indivar)]
+test_counts = goodcounts[,test_samples] %>% apply(2, function(x) x / sum(x))
+
+## Response var
+test_response = ttmd[get(sampvar) %in% test_samples, mget(dependentvar)]
+
+## Agglomerate.
+ogu_test_counts = test_counts %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    dplyr::select(!!colnames(ogu_train_counts)) %>%
+    as.matrix()
+
+spp_test_counts = test_counts %>% agglomerate(taxonomy, 's') %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    rename_all(~ paste0('s__',.)) %>%
+    dplyr::select(!!colnames(spp_train_counts)) %>%
+    as.matrix()
+ 
+gen_test_counts = test_counts %>% agglomerate(taxonomy, 'g') %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    rename_all(~ paste0('g__',.)) %>%
+    dplyr::select(!!colnames(gen_train_counts)) %>%
+    as.matrix()
+
+## Taxon-specific comps.
+ogu_test_comp = ogu_test_counts[,colnames(ogu_train_comp)]
+spp_test_comp = spp_test_counts[,colnames(spp_train_comp)]
+gen_test_comp = gen_test_counts[,colnames(gen_train_comp)]
+
+## Build training dataframe.
+nb_data_test = cbind(test_response, test_covars, gen_test_comp, spp_test_comp) %>% as_tibble()
+
+## selection variables.
+selvars = c(covars, colnames(spp_train_comp), colnames(gen_train_comp))
+```
+
+```{r nbTuneParams}
+lgb_classifier = boost_tree(
+   trees = lgb_ntrees
+ , tree_depth = tune()
+ , min_n = tune()
+ , loss_reduction = tune()
+ , sample_size = tune()
+ , mtry = tune()
+ , learn_rate = tune()
+ ) %>%
+set_engine("lightgbm",
+           #is_unbalance = TRUE,
+           #boosting = "dart",
+           print_every_n=10) %>%
+set_mode("classification")
+
+modl = lgb_classifier
+
+modl_formula = paste0(dependentvar, ' ~ .') %>% as.formula()
+modl_recipe = recipe(modl_formula, data = nb_data_train)
+
+modl_workflow = workflow() %>% 
+    add_model(modl) %>%
+    add_recipe(modl_recipe)
+
+print(modl_workflow)
+    
+modl_cvfolds = vfold_cv(nb_data_train, strata = dependentvar, v = lgb_k, repeats = lgb_repeats);
+
+## Make tuning grid.
+lgb_tune_grid = grid_latin_hypercube(
+   tree_depth()
+ , min_n()
+ , loss_reduction()
+ , sample_size = sample_prop()
+ , finalize(mtry(), nb_data_train)
+ , learn_rate()
+ #, alpha()
+ , size = lgb_gridsize
+ )
+    
+## Exec cross-validation of the model
+message('Running cross-validation of model...')
+nb_lgb_res = tune_grid(
+  modl_workflow
+  , resamples = modl_cvfolds
+  , grid = lgb_tune_grid
+  , metric_set(yardstick::accuracy
+             , yardstick::brier_class
+             , yardstick::f_meas
+             , yardstick::pr_auc
+             , yardstick::kap
+             , yardstick::roc_auc
+             )
+  , control = control_grid(save_pred = TRUE, verbose = TRUE, save_workflow = TRUE)
+)
+
+```
+
+```{r nbFit}
+nb_bfmodl = fit_best(nb_lgb_res, metric = 'brier_class')
+```
+
+```{r nbEvalModel}
+
+
+train_curves = get_roc_pr_curves(model = nb_bfmodl
+                  , data = nb_data_train
+                  , truth = nb_data_train[,dependentvar]
+                  , label = 'training')
+
+## Eval holdout data
+test_curves = get_roc_pr_curves(model = nb_bfmodl
+                  , data = nb_data_test
+                  , truth = nb_data_test[,dependentvar]
+                  , label = 'holdout')
+
+## Plor ROC-curves.
+train_roc_plot = ggplot() +
+  geom_line(data = train_curves[[1]], aes(x = 1 - specificity, y = sensitivity), color = '#34A6FF', size = 1) +
+  geom_abline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1
+    ) + theme_bw() + ggtitle('Training ROC Seroconversion NB')
+
+test_roc_plot = ggplot() +
+  geom_line(data = test_curves[[1]], aes(x = 1 - specificity, y = sensitivity), color = '#DD0534', size = 1) +
+  geom_abline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1
+    ) + theme_bw() + ggtitle('Holdout ROC Seroconversion NB')
+
+## Plot PR curves.
+noskill_pr_test = nb_data_test[,dependentvar] %>% unlist() %>% table() %>% (function(x) x[1] / (x[2] + x[1]))
+noskill_pr_train = nb_data_train[,dependentvar] %>% unlist() %>% table() %>% (function(x) x[1] / (x[2] + x[1]))
+
+train_pr_plot = ggplot() +
+  geom_line(data = train_curves[[2]], aes(x = recall, y = precision), color = '#34A6FF', size = 1) +
+  geom_hline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1,
+        yintercept = noskill_pr_train
+    ) + theme_bw() + ggtitle('Training PR Seroconversion NB')
+
+
+test_pr_plot = ggplot() +
+  geom_line(data = test_curves[[2]], aes(x = recall, y = precision), color = '#DD0534', size = 1) +
+  geom_hline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1,
+        yintercept = noskill_pr_test
+    ) + theme_bw() + ggtitle('Holdout PR Seroconversion NB')
+
+plot_grid(train_roc_plot, train_pr_plot, test_roc_plot, test_pr_plot)
+
+
+```
+
+```{r nbSHAPs}
+## Bind the data back together and get SHAPs for the full dataset.
+data_shap = nb_data_train %>% rbind(nb_data_test)
+
+shap_values = kernelshap(nb_bfmodl, data_shap, bg_X = data_shap, type = "prob")
+sv = shapviz(shap_values, which_class = 1)
+
+sv_importance(sv, kind = "bee")
+
+sv_force(sv, row_id = 1)
+sv_waterfall(sv, row_id = 1)
+
+```
+
+# Predicting seroconversion at 2mo
+```{r m2SplitData}
+## Variable names for configs
+dependentvar = 'Seroconverted'
+indivar = 'enrollment_id'
+sampvar = 'sample_name'
+timevar = 'visit'
+timepoint = '2mo'
+covars = c(colnames(alphadivs)) %>% setdiff('rn')
+strata = c('country') ## stratify to ensure even coverage of countries in the training/testing split
+
+ttmd = filtered_metadata[get(timevar) == timepoint, mget(c(sampvar, indivar, covars, dependentvar, strata))] %>% na.omit()
+
+train_indivs = ttmd[,sample(get(indivar), ceiling(.N*train_proportion)), by = c(strata)][,V1]
+test_indivs = setdiff(ttmd[,get(indivar)], train_indivs)
+train_samples = ttmd[get(indivar) %in% train_indivs, get(sampvar)]
+test_samples = ttmd[get(indivar) %in% test_indivs, get(sampvar)]
+```
+
+```{r m2TrainingSplit}
+## Training covariate data
+train_samples = ttmd[get(sampvar) %in% train_samples, get(sampvar)] ## Reorder according to the table.
+train_covars = ttmd[get(sampvar) %in% train_samples, mget(covars)]
+train_ids = ttmd[get(sampvar) %in% train_samples, mget(indivar)]
+train_counts = goodcounts[,train_samples] %>% apply(2, function(x) x / sum(x))
+
+## Response var
+train_response = ttmd[get(sampvar) %in% train_samples, mget(dependentvar)]
+
+## Agglomerate.
+ogu_train_counts = train_counts %>%
+    abundance(min_abundance) %>%
+    prevalence(min_prevalence) %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    as.matrix()
+
+spp_train_counts = train_counts %>%
+    agglomerate(taxonomy, 's') %>%
+    abundance(min_abundance) %>%
+    prevalence(min_prevalence) %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    rename_all(~ paste0('s__',.)) %>%
+    as.matrix()
+
+gen_train_counts = train_counts %>%
+    agglomerate(taxonomy, 'g') %>%
+    abundance(min_abundance) %>%
+    prevalence(min_prevalence) %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    rename_all(~ paste0('g__',.)) %>%
+    as.matrix()
+
+## Taxon-specific comps.
+ogu_train_comp = ogu_train_counts[,-union(ogu_train_counts %>% nearZeroVar()
+                                    , which(colSums(ogu_train_counts) == 0)
+                                    )]
+spp_train_comp = spp_train_counts[,-union(spp_train_counts %>% nearZeroVar()
+                                    , which(colSums(spp_train_counts) == 0)
+                                    )]
+gen_train_comp = gen_train_counts[,-union(gen_train_counts %>% nearZeroVar()
+                                    , which(colSums(gen_train_counts) == 0)
+                                    )]
+
+## Build training dataframe.
+m2_data_train = cbind(train_response, train_covars, gen_train_comp, spp_train_comp) %>% as_tibble()
+```
+
+```{r m2TestingSplit}
+## Training covariate data
+test_samples = ttmd[get(sampvar) %in% test_samples, get(sampvar)] ## Reorder according to the table.
+test_covars = ttmd[get(sampvar) %in% test_samples, mget(covars)]
+test_ids = ttmd[get(sampvar) %in% test_samples, mget(indivar)]
+test_counts = goodcounts[,test_samples] %>% apply(2, function(x) x / sum(x))
+
+## Response var
+test_response = ttmd[get(sampvar) %in% test_samples, mget(dependentvar)]
+
+## Agglomerate.
+ogu_test_counts = test_counts %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    dplyr::select(!!colnames(ogu_train_counts)) %>%
+    as.matrix()
+
+spp_test_counts = test_counts %>% agglomerate(taxonomy, 's') %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    rename_all(~ paste0('s__',.)) %>%
+    dplyr::select(!!colnames(spp_train_counts)) %>%
+    as.matrix()
+ 
+gen_test_counts = test_counts %>% agglomerate(taxonomy, 'g') %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    rename_all(~ paste0('g__',.)) %>%
+    dplyr::select(!!colnames(gen_train_counts)) %>%
+    as.matrix()
+
+## Taxon-specific comps.
+ogu_test_comp = ogu_test_counts[,colnames(ogu_train_comp)]
+spp_test_comp = spp_test_counts[,colnames(spp_train_comp)]
+gen_test_comp = gen_test_counts[,colnames(gen_train_comp)]
+
+## Build training dataframe.
+m2_data_test = cbind(test_response, test_covars, gen_test_comp, spp_test_comp) %>% as_tibble()
+
+```
+
+```{r m2TuneParams}
+lgb_classifier = boost_tree(
+   trees = lgb_ntrees
+ , tree_depth = tune()
+ , min_n = tune()
+ , loss_reduction = tune()
+ , sample_size = tune()
+ , mtry = tune()
+ , learn_rate = tune()
+ ) %>%
+set_engine("lightgbm",
+           #is_unbalance = TRUE,
+           #boosting = "dart",
+           print_every_n=10) %>%
+set_mode("classification")
+
+modl = lgb_classifier
+
+modl_formula = paste0(dependentvar, ' ~ .') %>% as.formula()
+modl_recipe = recipe(modl_formula, data = m2_data_train)
+
+modl_workflow = workflow() %>% 
+    add_model(modl) %>%
+    add_recipe(modl_recipe)
+
+print(modl_workflow)
+    
+modl_cvfolds = vfold_cv(m2_data_train, strata = dependentvar, v = lgb_k, repeats = lgb_repeats);
+
+## Make tuning grid.
+lgb_tune_grid = grid_latin_hypercube(
+   tree_depth()
+ , min_n()
+ , loss_reduction()
+ , sample_size = sample_prop()
+ , finalize(mtry(), m2_data_train)
+ , learn_rate()
+ #, alpha()
+ , size = lgb_gridsize
+ )
+    
+## Exec cross-validation of the model
+message('Running cross-validation of model...')
+m2_lgb_res = tune_grid(
+  modl_workflow
+  , resamples = modl_cvfolds
+  , grid = lgb_tune_grid
+  , metric_set(yardstick::accuracy
+             , yardstick::brier_class
+             , yardstick::f_meas
+             , yardstick::pr_auc
+             , yardstick::kap
+             , yardstick::roc_auc
+             )
+  , control = control_grid(save_pred = TRUE, verbose = TRUE, save_workflow = TRUE)
+)
+
+```
+
+```{r m2Fit}
+m2_bfmodl = fit_best(m2_lgb_res, metric = 'brier_class')
+```
+
+```{r m2EvalModel}
+train_curves = get_roc_pr_curves(model = m2_bfmodl
+                  , data = m2_data_train
+                  , truth = m2_data_train[,dependentvar]
+                  , label = 'training')
+
+## Eval holdout data
+test_curves = get_roc_pr_curves(model = m2_bfmodl
+                  , data = m2_data_test
+                  , truth = m2_data_test[,dependentvar]
+                  , label = 'holdout')
+
+## Plor ROC-curves.
+train_roc_plot = ggplot() +
+  geom_line(data = train_curves[[1]], aes(x = 1 - specificity, y = sensitivity), color = '#34A6FF', size = 1) +
+  geom_abline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1
+    ) + theme_bw() + ggtitle('Training ROC Seroconversion 2mo')
+
+test_roc_plot = ggplot() +
+  geom_line(data = test_curves[[1]], aes(x = 1 - specificity, y = sensitivity), color = '#DD0534', size = 1) +
+  geom_abline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1
+    ) + theme_bw() + ggtitle('Holdout ROC Seroconversion 2mo')
+
+## Plot PR curves.
+noskill_pr_test = m2_data_test[,dependentvar] %>% unlist() %>% table() %>% (function(x) x[1] / (x[2] + x[1]))
+noskill_pr_train = m2_data_train[,dependentvar] %>% unlist() %>% table() %>% (function(x) x[1] / (x[2] + x[1]))
+
+train_pr_plot = ggplot() +
+  geom_line(data = train_curves[[2]], aes(x = recall, y = precision), color = '#34A6FF', size = 1) +
+  geom_hline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1,
+        yintercept = noskill_pr_train
+    ) + theme_bw() + ggtitle('Training PR Seroconversion 2mo')
+
+
+test_pr_plot = ggplot() +
+  geom_line(data = test_curves[[2]], aes(x = recall, y = precision), color = '#DD0534', size = 1) +
+  geom_hline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1,
+        yintercept = noskill_pr_test
+    ) + theme_bw() + ggtitle('Holdout PR Seroconversion 2mo')
+
+plot_grid(train_roc_plot, train_pr_plot, test_roc_plot, test_pr_plot)
+
+
+```
+
+```{r m2SHAPs}
+data_shap = m2_data_train %>% rbind(m2_data_test)
+
+shap_values = kernelshap(m2_bfmodl, data_shap, bg_X = data_shap, type = "prob")
+sv = shapviz(shap_values, which_class = 1)
+
+sv_importance(sv, kind = "bee")
+
+sv_force(sv, row_id = 1)
+sv_waterfall(sv, row_id = 1)
+
+```
+
+# Predicting seroconversion at 4mo
+```{r m4SplitData}
+## Variable names for configs
+dependentvar = 'Seroconverted'
+indivar = 'enrollment_id'
+sampvar = 'sample_name'
+timevar = 'visit'
+timepoint = '4mo'
+covars = c(colnames(alphadivs)) %>% setdiff('rn')
+strata = c('country') ## stratify to ensure even coverage of countries in the training/testing split
+
+ttmd = filtered_metadata[get(timevar) == timepoint, mget(c(sampvar, indivar, covars, dependentvar, strata))] %>% na.omit()
+
+train_indivs = ttmd[,sample(get(indivar), ceiling(.N*train_proportion)), by = c(strata)][,V1]
+test_indivs = setdiff(ttmd[,get(indivar)], train_indivs)
+train_samples = ttmd[get(indivar) %in% train_indivs, get(sampvar)]
+test_samples = ttmd[get(indivar) %in% test_indivs, get(sampvar)]
+```
+
+```{r m4TrainingSplit}
+## Training covariate data
+train_samples = ttmd[get(sampvar) %in% train_samples, get(sampvar)] ## Reorder according to the table.
+train_covars = ttmd[get(sampvar) %in% train_samples, mget(covars)]
+train_ids = ttmd[get(sampvar) %in% train_samples, mget(indivar)]
+train_counts = goodcounts[,train_samples] %>% apply(2, function(x) x / sum(x))
+
+## Response var
+train_response = ttmd[get(sampvar) %in% train_samples, mget(dependentvar)]
+
+## Agglomerate.
+ogu_train_counts = train_counts %>%
+    abundance(min_abundance) %>%
+    prevalence(min_prevalence) %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    as.matrix()
+
+spp_train_counts = train_counts %>%
+    agglomerate(taxonomy, 's') %>%
+    abundance(min_abundance) %>%
+    prevalence(min_prevalence) %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    rename_all(~ paste0('s__',.)) %>%
+    as.matrix()
+
+gen_train_counts = train_counts %>%
+    agglomerate(taxonomy, 'g') %>%
+    abundance(min_abundance) %>%
+    prevalence(min_prevalence) %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    rename_all(~ paste0('g__',.)) %>%
+    as.matrix()
+
+## Taxon-specific comps.
+ogu_train_comp = ogu_train_counts[,-union(ogu_train_counts %>% nearZeroVar()
+                                    , which(colSums(ogu_train_counts) == 0)
+                                    )]
+spp_train_comp = spp_train_counts[,-union(spp_train_counts %>% nearZeroVar()
+                                    , which(colSums(spp_train_counts) == 0)
+                                    )]
+gen_train_comp = gen_train_counts[,-union(gen_train_counts %>% nearZeroVar()
+                                    , which(colSums(gen_train_counts) == 0)
+                                    )]
+
+## Build training dataframe.
+m4_data_train = cbind(train_response, train_covars, gen_train_comp, spp_train_comp) %>% as_tibble()
+```
+
+```{r m4TestingSplit}
+## Training covariate data
+test_samples = ttmd[get(sampvar) %in% test_samples, get(sampvar)] ## Reorder according to the table.
+test_covars = ttmd[get(sampvar) %in% test_samples, mget(covars)]
+test_ids = ttmd[get(sampvar) %in% test_samples, mget(indivar)]
+test_counts = goodcounts[,test_samples] %>% apply(2, function(x) x / sum(x))
+
+## Response var
+test_response = ttmd[get(sampvar) %in% test_samples, mget(dependentvar)]
+
+## Agglomerate.
+ogu_test_counts = test_counts %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    dplyr::select(!!colnames(ogu_train_counts)) %>%
+    as.matrix()
+
+spp_test_counts = test_counts %>% agglomerate(taxonomy, 's') %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    rename_all(~ paste0('s__',.)) %>%
+    dplyr::select(!!colnames(spp_train_counts)) %>%
+    as.matrix()
+ 
+gen_test_counts = test_counts %>% agglomerate(taxonomy, 'g') %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    rename_all(~ paste0('g__',.)) %>%
+    dplyr::select(!!colnames(gen_train_counts)) %>%
+    as.matrix()
+
+## Taxon-specific comps.
+ogu_test_comp = ogu_test_counts[,colnames(ogu_train_comp)]
+spp_test_comp = spp_test_counts[,colnames(spp_train_comp)]
+gen_test_comp = gen_test_counts[,colnames(gen_train_comp)]
+
+## Build training dataframe.
+m4_data_test = cbind(test_response, test_covars, gen_test_comp, spp_test_comp) %>% as_tibble()
+
+```
+
+```{r m4TuneParams}
+lgb_classifier = boost_tree(
+   trees = lgb_ntrees
+ , tree_depth = tune()
+ , min_n = tune()
+ , loss_reduction = tune()
+ , sample_size = tune()
+ , mtry = tune()
+ , learn_rate = tune()
+ ) %>%
+set_engine("lightgbm",
+           #is_unbalance = TRUE,
+           #boosting = "dart",
+           print_every_n=10) %>%
+set_mode("classification")
+
+modl = lgb_classifier
+
+modl_formula = paste0(dependentvar, ' ~ .') %>% as.formula()
+modl_recipe = recipe(modl_formula, data = m4_data_train)
+
+modl_workflow = workflow() %>% 
+    add_model(modl) %>%
+    add_recipe(modl_recipe)
+
+print(modl_workflow)
+    
+modl_cvfolds = vfold_cv(m4_data_train, strata = dependentvar, v = lgb_k, repeats = lgb_repeats);
+
+## Make tuning grid.
+lgb_tune_grid = grid_latin_hypercube(
+   tree_depth()
+ , min_n()
+ , loss_reduction()
+ , sample_size = sample_prop()
+ , finalize(mtry(), m4_data_train)
+ , learn_rate()
+ #, alpha()
+ , size = lgb_gridsize
+ )
+    
+## Exec cross-validation of the model
+message('Running cross-validation of model...')
+m4_lgb_res = tune_grid(
+  modl_workflow
+  , resamples = modl_cvfolds
+  , grid = lgb_tune_grid
+  , metric_set(yardstick::accuracy
+             , yardstick::brier_class
+             , yardstick::f_meas
+             , yardstick::pr_auc
+             , yardstick::kap
+             , yardstick::roc_auc
+             )
+  , control = control_grid(save_pred = TRUE, verbose = TRUE, save_workflow = TRUE)
+)
+```
+
+```{r m4Fit}
+m4_bfmodl = fit_best(m4_lgb_res, metric = 'brier_class')
+```
+
+```{r m4EvalModel}
+train_curves = get_roc_pr_curves(model = m4_bfmodl
+                  , data = m4_data_train
+                  , truth = m4_data_train[,dependentvar]
+                  , label = 'training')
+
+## Eval holdout data
+test_curves = get_roc_pr_curves(model = m4_bfmodl
+                  , data = m4_data_test
+                  , truth = m4_data_test[,dependentvar]
+                  , label = 'holdout')
+
+## Plor ROC-curves.
+train_roc_plot = ggplot() +
+  geom_line(data = train_curves[[1]], aes(x = 1 - specificity, y = sensitivity), color = '#34A6FF', size = 1) +
+  geom_abline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1
+    ) + theme_bw() + ggtitle('Training ROC Seroconversion 4mo')
+
+test_roc_plot = ggplot() +
+  geom_line(data = test_curves[[1]], aes(x = 1 - specificity, y = sensitivity), color = '#DD0534', size = 1) +
+  geom_abline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1
+    ) + theme_bw() + ggtitle('Holdout ROC Seroconversion 4mo')
+
+## Plot PR curves.
+noskill_pr_test = m4_data_test[,dependentvar] %>% unlist() %>% table() %>% (function(x) x[1] / (x[2] + x[1]))
+noskill_pr_train = m4_data_train[,dependentvar] %>% unlist() %>% table() %>% (function(x) x[1] / (x[2] + x[1]))
+
+train_pr_plot = ggplot() +
+  geom_line(data = train_curves[[2]], aes(x = recall, y = precision), color = '#34A6FF', size = 1) +
+  geom_hline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1,
+        yintercept = noskill_pr_train
+    ) + theme_bw() + ggtitle('Training PR Seroconversion 4mo')
+
+
+test_pr_plot = ggplot() +
+  geom_line(data = test_curves[[2]], aes(x = recall, y = precision), color = '#DD0534', size = 1) +
+  geom_hline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1,
+        yintercept = noskill_pr_test
+    ) + theme_bw() + ggtitle('Holdout PR Seroconversion 4mo')
+
+plot_grid(train_roc_plot, train_pr_plot, test_roc_plot, test_pr_plot)
+
+
+```
+
+```{r m4SHAPs}
+data_shap = m4_data_train %>% rbind(m4_data_test)
+
+shap_values = kernelshap(m4_bfmodl, data_shap, bg_X = data_shap, type = "prob")
+sv = shapviz(shap_values, which_class = 1)
+
+sv_importance(sv, kind = "bee")
+
+sv_force(sv, row_id = 1)
+sv_waterfall(sv, row_id = 1)
+
+```
+
+# Predicting shedding
+```{r shSplitData}
+## Variable names for configs
+dependentvar = 'rota_stool_pcr'
+indivar = 'enrollment_id'
+sampvar = 'sample_name'
+timevar = 'visit'
+timepoint = 'NB'
+covars = c(colnames(alphadivs)) %>% setdiff('rn')
+strata = c('country') ## stratify to ensure even coverage of countries in the training/testing split
+
+ttmd = filtered_metadata[get(timevar) == timepoint, mget(c(sampvar, indivar, covars, dependentvar, strata))] %>% na.omit()
+
+train_indivs = ttmd[,sample(get(indivar), ceiling(.N*train_proportion)), by = c(strata)][,V1]
+test_indivs = setdiff(ttmd[,get(indivar)], train_indivs)
+train_samples = ttmd[get(indivar) %in% train_indivs, get(sampvar)]
+test_samples = ttmd[get(indivar) %in% test_indivs, get(sampvar)]
+```
+
+```{r shTrainingSplit}
+## Training covariate data
+train_samples = ttmd[get(sampvar) %in% train_samples, get(sampvar)] ## Reorder according to the table.
+train_covars = ttmd[get(sampvar) %in% train_samples, mget(covars)]
+train_ids = ttmd[get(sampvar) %in% train_samples, mget(indivar)]
+train_counts = goodcounts[,train_samples] %>% apply(2, function(x) x / sum(x))
+
+## Response var
+train_response = ttmd[get(sampvar) %in% train_samples, mget(dependentvar)]
+
+## Agglomerate.
+ogu_train_counts = train_counts %>%
+    abundance(min_abundance) %>%
+    prevalence(min_prevalence) %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    as.matrix()
+
+spp_train_counts = train_counts %>%
+    agglomerate(taxonomy, 's') %>%
+    abundance(min_abundance) %>%
+    prevalence(min_prevalence) %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    rename_all(~ paste0('s__',.)) %>%
+    as.matrix()
+
+gen_train_counts = train_counts %>%
+    agglomerate(taxonomy, 'g') %>%
+    abundance(min_abundance) %>%
+    prevalence(min_prevalence) %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    rename_all(~ paste0('g__',.)) %>%
+    as.matrix()
+
+## Taxon-specific comps.
+ogu_train_comp = ogu_train_counts[,-union(ogu_train_counts %>% nearZeroVar()
+                                    , which(colSums(ogu_train_counts) == 0)
+                                    )]
+spp_train_comp = spp_train_counts[,-union(spp_train_counts %>% nearZeroVar()
+                                    , which(colSums(spp_train_counts) == 0)
+                                    )]
+gen_train_comp = gen_train_counts[,-union(gen_train_counts %>% nearZeroVar()
+                                    , which(colSums(gen_train_counts) == 0)
+                                    )]
+
+## Build training dataframe.
+sh_data_train = cbind(train_response, train_covars, gen_train_comp, spp_train_comp) %>% as_tibble()
+```
+
+```{r shTestingSplit}
+## Training covariate data
+test_samples = ttmd[get(sampvar) %in% test_samples, get(sampvar)] ## Reorder according to the table.
+test_covars = ttmd[get(sampvar) %in% test_samples, mget(covars)]
+test_ids = ttmd[get(sampvar) %in% test_samples, mget(indivar)]
+test_counts = goodcounts[,test_samples] %>% apply(2, function(x) x / sum(x))
+
+## Response var
+test_response = ttmd[get(sampvar) %in% test_samples, mget(dependentvar)]
+
+## Agglomerate.
+ogu_test_counts = test_counts %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    dplyr::select(!!colnames(ogu_train_counts)) %>%
+    as.matrix()
+
+spp_test_counts = test_counts %>% agglomerate(taxonomy, 's') %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    rename_all(~ paste0('s__',.)) %>%
+    dplyr::select(!!colnames(spp_train_counts)) %>%
+    as.matrix()
+ 
+gen_test_counts = test_counts %>% agglomerate(taxonomy, 'g') %>%
+    t() %>% 
+    as_tibble() %>%
+    rename_all(~ make.names(.)) %>%
+    rename_all(~ paste0('g__',.)) %>%
+    dplyr::select(!!colnames(gen_train_counts)) %>%
+    as.matrix()
+
+## Taxon-specific comps.
+ogu_test_comp = ogu_test_counts[,colnames(ogu_train_comp)]
+spp_test_comp = spp_test_counts[,colnames(spp_train_comp)]
+gen_test_comp = gen_test_counts[,colnames(gen_train_comp)]
+
+## Build training dataframe.
+sh_data_test = cbind(test_response, test_covars, gen_test_comp, spp_test_comp) %>% as_tibble()
+
+```
+
+```{r shTuneParams}
+lgb_classifier = boost_tree(
+   trees = lgb_ntrees
+ , tree_depth = tune()
+ , min_n = tune()
+ , loss_reduction = tune()
+ , sample_size = tune()
+ , mtry = tune()
+ , learn_rate = tune()
+ ) %>%
+set_engine("lightgbm",
+           is_unbalance = TRUE,
+           print_every_n=10) %>%
+set_mode("classification")
+
+modl = lgb_classifier
+
+modl_formula = paste0(dependentvar, ' ~ .') %>% as.formula()
+modl_recipe = recipe(modl_formula, data = sh_data_train)
+
+modl_workflow = workflow() %>% 
+    add_model(modl) %>%
+    add_recipe(modl_recipe)
+
+print(modl_workflow)
+    
+modl_cvfolds = vfold_cv(sh_data_train, strata = dependentvar, v = lgb_k, repeats = lgb_repeats);
+
+## Make tuning grid.
+lgb_tune_grid = grid_latin_hypercube(
+   tree_depth()
+ , min_n()
+ , loss_reduction()
+ , sample_size = sample_prop()
+ , finalize(mtry(), sh_data_train)
+ , learn_rate()
+ #, alpha()
+ , size = lgb_gridsize
+ )
+    
+## Exec cross-validation of the model
+message('Running cross-validation of model...')
+sh_lgb_res = tune_grid(
+  modl_workflow
+  , resamples = modl_cvfolds
+  , grid = lgb_tune_grid
+  , metric_set(yardstick::accuracy
+             , yardstick::brier_class
+             , yardstick::f_meas
+             , yardstick::pr_auc
+             , yardstick::kap
+             , yardstick::roc_auc
+             )
+  , control = control_grid(save_pred = TRUE, verbose = TRUE, save_workflow = TRUE)
+)
+```
+
+```{r shFit}
+sh_bfmodl = fit_best(sh_lgb_res, metric = 'brier_class')
+```
+
+```{r shEvalModel}
+
+
+train_curves = get_roc_pr_curves(model = sh_bfmodl
+                  , data = sh_data_train
+                  , truth = sh_data_train[,dependentvar]
+                  , label = 'training')
+
+## Eval holdout data
+test_curves = get_roc_pr_curves(model = sh_bfmodl
+                  , data = sh_data_test
+                  , truth = sh_data_test[,dependentvar]
+                  , label = 'holdout')
+
+## Plor ROC-curves.
+train_roc_plot = ggplot() +
+  geom_line(data = train_curves[[1]], aes(x = 1 - specificity, y = sensitivity), color = '#34A6FF', size = 1) +
+  geom_abline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1
+    ) + theme_bw() + ggtitle('Training ROC Take NB')
+
+test_roc_plot = ggplot() +
+  geom_line(data = test_curves[[1]], aes(x = 1 - specificity, y = sensitivity), color = '#DD0534', size = 1) +
+  geom_abline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1
+    ) + theme_bw() + ggtitle('Holdout ROC Take NB')
+
+## Plot PR curves.
+noskill_pr_test = sh_data_test[,dependentvar] %>% unlist() %>% table() %>% (function(x) x[1] / (x[2] + x[1]))
+noskill_pr_train = sh_data_train[,dependentvar] %>% unlist() %>% table() %>% (function(x) x[1] / (x[2] + x[1]))
+
+train_pr_plot = ggplot() +
+  geom_line(data = train_curves[[2]], aes(x = recall, y = precision), color = '#34A6FF', size = 1) +
+  geom_hline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1,
+        yintercept = noskill_pr_train
+    ) + theme_bw() + ggtitle('Training PR Take NB')
+
+
+test_pr_plot = ggplot() +
+  geom_line(data = test_curves[[2]], aes(x = recall, y = precision), color = '#DD0534', size = 1) +
+  geom_hline(
+        lty = 2, alpha = 0.5,
+        color = "gray50",
+        size = 1,
+        yintercept = noskill_pr_test
+    ) + theme_bw() + ggtitle('Holdout PR Take NB')
+
+plot_grid(train_roc_plot, train_pr_plot, test_roc_plot, test_pr_plot)
+
+
+```
+
+```{r shSHAPs}
+## Bind the data back together and get SHAPs for the full dataset.
+data_shap = sh_data_train %>% rbind(sh_data_test)
+
+shap_values = kernelshap(sh_bfmodl, data_shap, bg_X = data_shap, type = "prob")
+sv = shapviz(shap_values, which_class = 1)
+
+sv_importance(sv, kind = "bee")
+
+sv_force(sv, row_id = 1)
+sv_waterfall(sv, row_id = 1)
+
+```
+
+# End
+```{r}
+save(list = ls(all.names = TRUE), file = 'rota-lgbm.RData')
+sessionInfo()
+```

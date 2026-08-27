@@ -1,0 +1,427 @@
+---
+title: "ROTA Metagenomics: Intialize"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+    number_sections: true
+    theme: lumen
+---
+```{r init_setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width=10, fig.height=8, error = TRUE)
+```
+
+```{r init_libraries}
+## override library function to silence all package messages.
+silence = function(x) suppressPackageStartupMessages(suppressWarnings({invisible({capture.output(x)})}))
+library = function(...) silence({base::library(...)})
+
+library('data.table')
+library('tidyverse')
+library('vegan')
+library('decontam')
+library('ape')
+library('rbiom')
+library('picante')
+library('phytools')
+library('compositions')
+library('uwot')
+library('phyloseq')
+library('mia')
+library('dqrng')
+
+set.seed(42)
+```
+
+``` {r params}
+metadata_file = 'data/metadata.tsv.xls'
+biom_file = 'data/rotavirus-woltka-biomtables/combined-none.coverage-1.0.biom'
+taxonomy_ref = 'data/gtdb-lineages.txt'
+tree_ref = 'data/wol.nwk'
+sample_prep_file = 'data/sample-prep.tsv.xls'
+
+rarefy_depth = 5e5
+```
+
+# Import
+In this section, we read in the sample data to perform some preprocessing. We change the types of some of the data and record sample names associated with the experimental design. Also print the column names for the metadata to refer back to.
+```{r SampleData}
+metadata = fread(file = metadata_file, sep='\t', header=TRUE)
+
+mocks = metadata[SampleType == 'Mock', sample_name]
+blanks = metadata[SampleType == 'Blank', sample_name]
+pcrblanks = metadata[SampleType == 'PCR Blank', sample_name]
+
+colnames(metadata)
+
+metadata[delivery == '', delivery := NA]
+metadata[formula_bm == '', formula_bm := NA]
+metadata[country == '', country := NA]
+metadata[Seroconverted == '', Seroconverted := NA]
+
+metadata[, visit := factor(visit, levels = c('NB', '2mo', '4mo'))]
+metadata[formula_bm == 'FORMULA', feeding_milk := 0]
+metadata[formula_bm == 'MOM', feeding_form := 0]
+metadata[formula_bm %in% c('MOM', 'BOTH'), feeding_milk := 1]
+metadata[formula_bm %in% c('FORMULA', 'BOTH'), feeding_form := 1]
+
+## Plot rota sero
+ggplot(metadata[!is.na(Seroconverted),]) +
+    geom_point(aes(x = log2(pre_rota_sero_iga)
+                 , y = log2(post_rota_sero_iga)
+                 , color = Seroconverted)) +
+    theme_bw() +
+    coord_equal() +
+    theme(legend.position = 'top')
+
+setkey(metadata, sample_name)
+```
+
+# Preprocess
+Here, we read in the reference taxonomy. We then split the reference taxonomy into ranks and fix the hierarchy of taxa so that the lowest level at which the data are assigned is used. GTDB uses greengenes-format taxonomy strings.
+```{r RefTaxonomy, warning=FALSE}
+lineageref = fread(taxonomy_ref, sep='\t', header=FALSE)
+lineageref[,V2 := gsub('; ',';', V2)]
+
+splitref = strsplit(lineageref[,V2], ';') %>% lapply(strsplit, '__') %>% lapply(unlist) %>% lapply(matrix, ncol = 2, byrow = TRUE)
+
+reftaxonomy = lapply(1:nrow(lineageref),
+    function(x) setNames(splitref[[x]][,2], splitref[[x]][,1])[c('d', 'p', 'c', 'o', 'f', 'g', 's')]
+) %>%
+do.call('rbind', .) %>%
+as.data.table()
+
+## Unassigned at each level.
+reftaxonomy[p == 'c', c('p','c','o','f','g','s') := paste0('Unassigned ', d)]
+reftaxonomy[c == 'o', c('c','o','f','g','s') := paste0('Unassigned ', p)]
+reftaxonomy[o == 'f', c('o','f','g','s')  := paste0('Unassigned ', c)]
+reftaxonomy[f == 'g', c('f','g','s')  := paste0('Unassigned ', o)]
+reftaxonomy[g == 's', c('g','s')  := paste0('Unassigned ', f)]
+reftaxonomy[s == 'd', s := paste0('Unassigned ', g)]
+
+## Build reference taxonomy table (for phyloseq objs)
+reftaxtable = as.matrix(reftaxonomy)
+colnames(reftaxtable) = c('Domain', 'Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species')
+rownames(reftaxtable) = lineageref[,V1]
+
+## Build external lookup datatable.
+reftaxonomy$GID = lineageref[,V1]
+setkey(reftaxonomy, GID)
+
+```
+
+Read in the biom file that contains the OGUs, as well as the reference tree. Create a count matrix out of the biom matrix and change the rownames to the OGU id.
+```{r ReadData}
+## Extract species data from biom.
+species = biomformat::read_hdf5_biom(biom_file)
+allcounts = species$data %>%
+    do.call('rbind', .) %>%
+    as.matrix() %>%
+    as.data.table()
+
+counts = cbind(species$rows %>% lapply(function(x) x$id) %>% do.call('c',.), allcounts) 
+colnames(counts)[1] = 'GID'
+
+## Decontam to assess initial contamination levels? Is there a Qiime2-plugin
+## for decontam/SourceTracker?
+counts[,c(mocks) := NULL]
+counts[,c(pcrblanks) := NULL]
+
+## Bind tables together.
+setkey(counts, GID)
+taxonomy = reftaxonomy[counts[,GID],]
+
+## Read in the tree.
+woltree = read.tree(tree_ref)
+rwoltree = midpoint.root(woltree)
+
+## Count matrix if that is your preference
+countmatrix = counts[,-1] %>% as.matrix()
+rownames(countmatrix) = counts[,GID]
+```
+
+Execute decontam using the frequency method, based on the gdna concentration from the sample prep files.
+```{r Decontam}
+sampleprep = fread(file = sample_prep_file, sep='\t', header=   , check.names=TRUE) %>% as.data.frame()
+rownames(sampleprep) = sampleprep$sample_name %>% gsub('\\.','_',.)
+
+sampleprep = sampleprep[colnames(countmatrix),]
+sampleprep$gdna_conc = as.numeric(sampleprep$gdna_conc)
+
+otus = otu_table(countmatrix, taxa_are_rows = TRUE)
+sams = sample_data(sampleprep)
+
+physeq = phyloseq(otus, sams)
+
+contams = isContaminant(physeq, method = 'frequency', conc = 'gdna_conc') %>% as.data.table(keep.rownames=TRUE)
+
+contamtaxa = contams[contaminant == TRUE, rn]
+keeptaxa = contams[contaminant == FALSE, rn]
+
+## Exclude contaminant taxa.
+decontammatrix = countmatrix[keeptaxa,]
+
+```
+
+Rarefy to 500,000 using a custom function -- faster than phyloseq's default rarefy function.
+```{r Rarefy}
+## Rarefy to even library size for some downstream operations
+## This is necessary to assess diversity.
+rarefy = function(x, n)
+## Rarefy function for large sample-sizes. In essence, this function is just the
+## fastest interpretation of the following operations:
+## 1. Convert from wide to long
+## 2. Expand the long population matrix into a data.table with each row
+##    representing an individual
+## 3. Subsample rows without replacement.
+## 4. Tabulate the subsampled data.
+## 5. Convert from long back to wide, add zeroes back into the matrix & return.
+## Params:
+## x = a count matrix, where columns are samples, to rarefy
+## n = the threshold to rarefy the counts.
+## Returns:
+## A rarefied matrix where columns are samples.
+{
+    paste('subsampling to', n, 'otus...') %>% message()
+    
+    ## Wide to long.
+    mdt = reshape2::melt(x[, colSums(x) >= n]) %>% as.data.table()
+    
+    ## Drop zero-value OTUs
+    mdt = mdt[value > 0,]
+    
+    ## Subsample without replacement
+    subsam = mdt[,rep(Var1, value) 
+                 %>% dqsample(size = n, replace = FALSE) 
+                 %>% table() 
+                 %>% as.data.table()
+             , by = Var2]
+    
+    ## Change colnames
+    colnames(subsam) = c('sample', 'otu', 'subsamn')
+    
+    ## Long back to wide
+    outdt = data.table::dcast(subsam
+                            , formula = otu ~ sample
+                            , value.var = 'subsamn')
+    
+    ## Cast as matrix, removing first column (the ids).
+    outmat = outdt[,-1] %>% as.matrix()
+    rownames(outmat) = outdt[,otu]
+    
+    ## Clean up NAs and remove zero-count rows.
+    outmat[is.na(outmat)] = 0
+    outmat = outmat[rowSums(outmat) > 0,]
+    
+    paste(ncol(x) - ncol(outmat), 'samples were removed.') %>% message()
+    paste(nrow(x) - nrow(outmat), 'otus were removed.') %>% message()
+    
+    return(outmat)
+}
+
+## Rarefy.
+rarecounts = rarefy(decontammatrix, rarefy_depth)
+
+## Drop the sample of unknown provenance
+keepsams = setdiff(colnames(rarecounts), 'PP164')
+
+## Constrain age ranges by excluding samples.
+keepsams = setdiff(keepsams, metadata[visit == 'NB' & age > 30, sample_name]) # < 30 DOL
+keepsams = setdiff(keepsams, metadata[visit == '2mo' & !(age > 30 & age <= 90), sample_name]) # 31-90 DOL
+keepsams = setdiff(keepsams, metadata[visit == '4mo' & !(age > 90), sample_name]) # > 90 DOL
+
+## Omit samples that are rarefied out.
+goodcounts = decontammatrix[,keepsams]
+
+## Build phyloseq objects
+oturare = otu_table(rarecounts, taxa_are_rows = TRUE)
+otudecon = otu_table(goodcounts, taxa_are_rows = TRUE)
+
+samdf = metadata[colnames(rarecounts),] %>% as.data.frame()
+rownames(samdf) = colnames(rarecounts)
+sams = samdf %>% sample_data()
+
+taxrare = reftaxtable[rownames(oturare),] %>% tax_table()
+taxdecon = reftaxtable[rownames(otudecon),] %>% tax_table()
+
+```
+
+Grab only patients for whom we have all timepoints in the dataset. Exclude all others.
+```{r PatientCounts}
+patientcounts = metadata[colnames(goodcounts), enrollment_id %>% table() %>% data.table()] %>% setNames(c('enrollment_id', 'number'))
+
+all_timepoint_patients = patientcounts[number == 3, enrollment_id]
+all_timepoint_samples = metadata[enrollment_id %in% all_timepoint_patients, sample_name] %>% intersect(colnames(goodcounts))
+
+## Var alltimecountmatrix contains the count matrix of patients where we have
+## data for all timepoints.
+all_timepoint_goodcounts = goodcounts[,all_timepoint_samples]
+all_timepoint_rarecounts = rarecounts[,all_timepoint_samples]
+```
+
+# Transforms
+Execute important transformations on the global dataset.
+```{r Transforms}
+
+min_prevalence = 0.05
+min_abundance = 0.01
+pseudocount = 1
+
+agglomerate = function(counts, taxonomy, rank)
+## Agglomerate function for large sample-sizes.
+## 1. Convert from wide to long
+## 2. Bind to taxonomy
+## 3. Sum counts within selected rank
+## 4. Convert from long back to wide, add zeroes back into the matrix & return.
+## Params:
+## counts = a count matrix, where columns are samples, to agglomerate.
+## taxonomy = a matrix or data frame where rows are OTUs, representing taxonomy
+## rank = One of the columns of the taxonomy matrix (a string) to agglomerate on
+## Returns:
+## A count matrix where columns are samples and rows are the rank of interest.
+{
+    mcounts = reshape2::melt(counts) %>% as.data.table() %>% setkey(Var1)
+    mtax = taxonomy[mcounts,][,.(value = sum(value)), by = .(Var2, R = get(rank))]
+    
+    dtax = data.table::dcast(mtax, R ~ Var2, value.var = 'value')
+    aggmatrix = dtax[,-1] %>% as.matrix()
+    rownames(aggmatrix) = dtax[,R]
+    
+    return(aggmatrix)
+}
+
+## Prevalence filter.
+## Params:
+## counts = a count matrix where samples are columns.
+## min_prevalence = minimum prevalence threshold (as a decimal).
+## Returns:
+# A filtered count matrix with rows in fewer samples than the threshold of
+# min_prevalence removed.
+prevalence = function(counts, min_prevalence)
+    counts[rowSums(counts > 0) > (ncol(counts)*min_prevalence),];
+
+## Abundance filter.
+## Params:
+## counts = a count matrix where samples are columns.
+## min_abundance = minimum abundance threshold (as a decimal).
+## Returns:
+## A filtered count matrix with samples at a lower abundance in any sample than
+## the threshold removed.
+abundance = function(counts, min_abundance)
+    counts[(rowSums(apply(counts, 2, function(x) x/sum(x)) >= min_abundance) > 0) %>% which(),];
+
+## CLR transform.
+## Params:
+## counts = a count matrix where samples are rows.
+## pseudocount = value to be added to remove zeros
+## Returns:
+## A centered-logratio -transformed count matrix.
+clrtrans = function(x, pseudocount)
+{
+    tr = clr(x + pseudocount) %>% as.matrix()
+    colnames(tr) = colnames(x)
+    return(tr)
+}
+
+## Agglomerate.
+ogu_counts = goodcounts %>%
+    abundance(min_abundance) %>%
+    prevalence(min_prevalence)
+
+spp_counts = goodcounts %>%
+    agglomerate(taxonomy, 's') %>%
+    abundance(min_abundance) %>%
+    prevalence(min_prevalence)
+
+gen_counts = goodcounts %>%
+    agglomerate(taxonomy, 'g') %>%
+    abundance(min_abundance) %>%
+    prevalence(min_prevalence)
+
+## Taxon-specific clrs.
+ogu_clr = ogu_counts %>%
+    t() %>%
+    clrtrans(pseudocount)
+
+spp_clr = spp_counts %>%
+    t() %>%
+    clrtrans(pseudocount)
+
+gen_clr = gen_counts %>%
+    t() %>%
+    clrtrans(pseudocount)
+
+## Basic transforms.
+trarecounts = rarecounts %>% t() ## Transpose.
+prarecounts = rarecounts %>% apply(2, function(x) x/sum(x)) ## Percent abund.
+hrarecounts = prarecounts %>% apply(2, sqrt) ## Hellinger transform.
+
+```
+
+## Cross-sectional metadata table
+```{r}
+## Filter metadata to remove rarefied samples.
+filtered_metadata = metadata[sample_name %in% colnames(goodcounts),]
+
+## Bind cross-sectional data table together
+cs_md = filtered_metadata[
+     !duplicated(enrollment_id)
+   & !is.na(post_rota_sero_iga)
+   & !is.na(pre_rota_sero_iga)
+   
+    , .(enrollment_id, country
+      , Seroconverted
+      , seropositive_pre = pre_rota_sero_iga > 20
+      , seropositive_post = post_rota_sero_iga > 20
+      , rota_stool_pcr
+      , rota_sero_iga_fc
+      , log_rota_sero_iga_fc = log(rota_sero_iga_fc)
+      , post_rota_sero_iga
+      , log_post_rota_sero_iga = log(post_rota_sero_iga)
+      , pre_rota_sero_iga
+      , log_pre_rota_sero_iga = log(pre_rota_sero_iga)
+      , delivery
+      , gest_age
+      , Secretor
+      , inf_hispanic
+      , inf_birth_weight
+      , sex
+      )] %>% setkey(enrollment_id)
+
+## Add in diet rows
+dietrows = filtered_metadata[
+      !is.na(visit)
+    & !is.na(post_rota_sero_iga)
+    & !is.na(pre_rota_sero_iga)
+    , .(formula_bm
+      , visit
+      , feeding_milk
+      , feeding_form
+      , age
+      , abx_status
+      , solid_food_introduced
+      , enrollment_id
+      )]
+
+filtered_metadata[,feeding_milk := NA]
+filtered_metadata[,feeding_form := NA]
+
+## Make it cross sectional by binding visit.
+cs_diet_data = dietrows %>%
+    dcast(enrollment_id ~ visit
+    , value.var = c('feeding_milk', 'feeding_form', 'age', 'solid_food_introduced', 'formula_bm')) %>%
+    setkey(enrollment_id)
+
+## Bind together.
+cross_sectional_metadata = cs_md %>%
+    cbind(cs_diet_data[cs_md[,enrollment_id],-1])
+
+```
+
+```{r Save}
+save(list = ls(all.names = TRUE), file = 'initialized-dataset.RData')
+sessionInfo()
+```
