@@ -26,7 +26,6 @@ Filename | Description
 m1-lgbm.rds | LightGBM ML model at timepoint 1.
 m2-lgbm.rds | LightGBM ML model at timepoint 2.
 m4-lgbm.rds | LightGBM ML model at timepoint 4.
-m4-lgbm.rds | LightGBM ML model at timepoint 4.
 
 Directory | Description
 ------------ | -------------
