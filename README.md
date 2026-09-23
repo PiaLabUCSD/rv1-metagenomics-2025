@@ -1,5 +1,7 @@
-This is the code repository for the analysis of the Panama, Peru, and US cohort by the Pannaraj & Gilbert Labs. Here, we analyze the infant gut microbiome at 1, 2, and 4 MOL to describe patterns in gut ecology that correspond to differences in monovalent oral rotavirus vaccine response (RV1). For more detail and interpretation of the results, please refer to [Seymour et al. (2026)](https://doi.org/10.1038/s41467-026-78148-x). 
- A table below lists source files, outputs, and their descriptions.
+## Summary
+This is the code repository for the analysis of the Panama, Peru, and US cohort by the Pannaraj & Gilbert Labs. Here, we analyzed the infant gut microbiome at 1, 2, and 4 MOL to describe patterns in gut ecology that correspond to differences in monovalent oral rotavirus vaccine response (RV1). For additional information regarding the cohort, methods, and interpretation of the results, please refer to the relevant publication: [Seymour et al. (2026)](https://doi.org/10.1038/s41467-026-78148-x).
+
+The tables below list source files, outputs, and their descriptions.
 
 ## Description of contents
 Filename | Description
@@ -33,3 +35,6 @@ Directory | Description
 results/ | Output folder for other results.
 results/reports | knit-all.R will knit reports to this folder by default.
 
+---
+
+*Last updated: September 22, 2026*
