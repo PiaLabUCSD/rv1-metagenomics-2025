@@ -1,9 +1,10 @@
-This is the code repository for the analysis of the Panama, Peru, and US multicountry RV1 microbiome cohort by the Pannaraj & Gilbert Labs. A table below lists source files, outputs, and their descriptions.
+This is the code repository for the analysis of the Panama, Peru, and US cohort by the Pannaraj & Gilbert Labs. Here, we analyze the infant gut microbiome at 1, 2, and 4 MOL to describe patterns in gut ecology that correspond to differences in monovalent oral rotavirus vaccine response (RV1). For more detail and interpretation of the results, please refer to [Seymour et al. (2026)](https://doi.org/10.1038/s41467-026-78148-x). 
+ A table below lists source files, outputs, and their descriptions.
 
 ## Description of contents
 Filename | Description
 ------------ | -------------
-knit-all.R | Main entry point. Run this script to run the whole analysis.
+knit-all.R | Main script. Run this script to run the whole analysis.
 initialize.Rmd | Initialize the microbiome & clinical datasets. Reads the data into R from the biom files and the metadata files.
 alpha-diversity.Rmd | Perform alpha-diversity LMMs.
 beta-diversity.Rmd | Quantify beta-diversity metrics, PERMANOVA, and unconstrained /constrained+conditioned ordinations
